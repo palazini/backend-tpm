@@ -1,0 +1,651 @@
+﻿import { Router } from 'express';
+import { pool } from '../db';
+import { slugifyItem } from '../utils/slug';
+import { sseBroadcast } from '../utils/sse';
+
+export const chamadosRouter = Router();
+
+// ---------- Chamados: lista com filtros + paginaÃ§Ã£o ----------
+chamadosRouter.get("/chamados", async (req, res) => {
+  try {
+    const status          = req.query.status as string | undefined;
+    const tipo            = req.query.tipo   as string | undefined;
+    const maquinaTag      = req.query.maquinaTag as string | undefined;
+    const maquinaId       = req.query.maquinaId as string | undefined;
+    const criadoPorEmail  = req.query.criadoPorEmail as string | undefined;
+    const manutentorEmail = req.query.manutentorEmail as string | undefined;
+    const from            = req.query.from as string | undefined;
+    const to              = req.query.to   as string | undefined;
+
+    const page = Math.max(parseInt(String(req.query.page ?? "1"), 10) || 1, 1);
+    const pageSize = Math.min(Math.max(parseInt(String(req.query.pageSize ?? "20"), 10) || 20, 1), 100);
+    const offset = (page - 1) * pageSize;
+
+    const params: any[] = [];
+    const where: string[] = [];
+
+    // status (robusto p/ "ConcluÃ­do", "Concluido", "concluido"...)
+    let isConcluido = false;
+    if (status) {
+      const s = status.toLowerCase();
+      if (s.startsWith("conclu")) {
+        isConcluido = true;
+        where.push(`LOWER(c.status) LIKE 'conclu%'`);
+      } else {
+        params.push(status);
+        where.push(`LOWER(c.status) = LOWER($${params.length})`);
+      }
+    }
+
+    // tipo (case-insensitive)
+    if (tipo) {
+      params.push(tipo);
+      where.push(`LOWER(c.tipo) = LOWER($${params.length})`);
+    }
+
+    if (maquinaTag) {
+      params.push(maquinaTag);
+      where.push(`m.tag = $${params.length}`);
+    }
+
+    if (maquinaId) {
+      params.push(maquinaId);
+      where.push(`c.maquina_id = $${params.length}`);
+    }
+
+    // e-mail de quem criou (case-insensitive)
+    if (criadoPorEmail) {
+      params.push(criadoPorEmail);
+      where.push(`LOWER(u.email) = LOWER($${params.length})`);
+    }
+
+    // manutentor: cobre manutentor_id E colunas de atribuiÃ§Ã£o por e-mail (se existirem)
+    if (manutentorEmail) {
+      params.push(manutentorEmail);
+      const idx = params.length;
+      where.push(`
+        (
+          LOWER(um.email) = LOWER($${idx})
+          OR LOWER(COALESCE(c.atribuido_para_email, '')) = LOWER($${idx})
+        )
+      `);
+    }
+
+    // PerÃ­odo: se ConcluÃ­do, filtra por concluido_em; senÃ£o por criado_em
+    const dateCol = isConcluido ? "c.concluido_em" : "c.criado_em";
+    if (from) {
+      params.push(new Date(from).toISOString());
+      where.push(`${dateCol} >= $${params.length}::timestamptz`);
+    }
+    if (to) {
+      params.push(new Date(to).toISOString());
+      where.push(`${dateCol} <= $${params.length}::timestamptz`);
+    }
+
+    const whereSql = where.length ? where.join(" AND ") : "1=1";
+
+    // total
+    const { rows: countRows } = await pool.query(
+      `SELECT COUNT(*)::int AS total
+         FROM public.chamados c
+         JOIN public.maquinas  m  ON m.id  = c.maquina_id
+         JOIN public.usuarios  u  ON u.id  = c.criado_por_id
+         LEFT JOIN public.usuarios um ON um.id = c.manutentor_id
+        WHERE ${whereSql}`,
+      params
+    );
+    const total = countRows[0]?.total ?? 0;
+
+    // itens
+    const orderCol = isConcluido ? "c.concluido_em" : "c.criado_em";
+    const params2 = [...params, pageSize, offset];
+    const { rows: items } = await pool.query(
+      `SELECT
+         c.id,
+         m.nome  AS maquina,
+         c.tipo,
+         c.status,
+         c.causa,
+         c.descricao,
+         c.item,
+         c.checklist_item_key AS "checklistItemKey",
+         u.nome  AS criado_por,
+         um.nome AS manutentor,
+         to_char(c.criado_em,    'YYYY-MM-DD HH24:MI') AS criado_em,
+         to_char(c.concluido_em, 'YYYY-MM-DD HH24:MI') AS concluido_em
+       FROM public.chamados c
+       JOIN public.maquinas  m  ON m.id  = c.maquina_id
+       JOIN public.usuarios  u  ON u.id  = c.criado_por_id
+       LEFT JOIN public.usuarios um ON um.id = c.manutentor_id
+       WHERE ${whereSql}
+       ORDER BY ${orderCol} DESC NULLS LAST
+       LIMIT $${params2.length - 1} OFFSET $${params2.length}`,
+      params2
+    );
+
+    res.json({ items, page, pageSize, total, hasNext: offset + items.length < total });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// ---------- Chamados: detalhe (patch 3 - versÃ£o completa) ----------
+chamadosRouter.get("/chamados/:id", async (req, res) => {
+  try {
+    const id = String(req.params.id);
+
+    // Detalhe do chamado + responsÃ¡vel atual
+    const { rows } = await pool.query(
+      `
+      SELECT
+        c.id,
+        c.fs_id,
+        m.nome AS maquina,
+        c.tipo,
+        c.status,
+
+        -- Texto / serviÃ§o
+        c.descricao,
+        c.problema_reportado,
+        c.causa,
+        COALESCE(c.servico_realizado, c.solucao) AS servico_realizado,
+
+        -- Datas
+        to_char(c.criado_em,    'YYYY-MM-DD HH24:MI') AS criado_em,
+        to_char(c.concluido_em, 'YYYY-MM-DD HH24:MI') AS concluido_em,
+
+        -- Quem criou
+        c.criado_por_id,
+        COALESCE(c.criado_por_nome, ucri.nome)   AS criado_por,
+        ucri.email                                AS criado_por_email,
+
+        -- Manutentor (quem atendeu)
+        c.atendido_por_id,
+        COALESCE(c.atendido_por_nome, umat.nome) AS manutentor,
+        umat.email                                AS manutentor_email,
+
+        -- AtribuÃ­do (histÃ³rico da importaÃ§Ã£o)
+        c.atribuido_para_id,
+        c.atribuido_para_nome,
+        c.atribuido_para_email,
+
+        -- responsÃ¡vel atual (o que a UI mostra como AtribuÃ­do a)
+        c.responsavel_atual_id,
+        ru.nome   AS responsavel_atual_nome,
+        ru.email  AS responsavel_atual_email,
+
+        -- ðŸ”½ Checklist âœ… sempre como JSONB (evita misturar text[]/array_agg)
+        COALESCE(c.checklist, '[]'::jsonb) AS checklist,
+
+        -- Metadados do checklist
+        CASE WHEN c.tipo = 'preventiva' THEN 'preventiva' ELSE NULL END AS tipo_checklist,
+        CASE WHEN c.tipo = 'preventiva' AND c.checklist IS NOT NULL
+             THEN jsonb_array_length(c.checklist)
+             ELSE NULL
+        END AS qtd_itens,
+
+        -- Aliases normalizados para facilitar no front
+        COALESCE(c.responsavel_atual_id, c.atendido_por_id, c.atribuido_para_id)     AS manutentor_id_norm,
+        COALESCE(ru.email,                umat.email,        c.atribuido_para_email) AS manutentor_email_norm,
+        COALESCE(ru.nome,                 umat.nome,         c.atribuido_para_nome)  AS manutentor_nome_norm
+
+      FROM public.chamados c
+      JOIN public.maquinas  m   ON m.id  = c.maquina_id
+      LEFT JOIN public.usuarios ucri ON ucri.id = c.criado_por_id
+      LEFT JOIN public.usuarios umat ON umat.id = c.atendido_por_id
+      LEFT JOIN public.usuarios ru   ON ru.id   = c.responsavel_atual_id
+      WHERE c.id = $1
+      LIMIT 1;
+      `,
+      [id]
+    );
+
+    if (!rows.length) {
+      return res.status(404).json({ error: "Chamado nÃ£o encontrado." });
+    }
+    const chamado = rows[0];
+
+    // ObservaÃ§Ãµes (texto sempre string; sem arrays SQL)
+    const obs = await pool.query(
+      `
+      SELECT
+        COALESCE(o.texto, o.mensagem, '')            AS texto,
+        to_char(o.criado_em,'YYYY-MM-DD HH24:MI')     AS criado_em,
+        COALESCE(o.autor_nome, u.nome, 'Sistema')     AS autor
+      FROM public.chamado_observacoes o
+      LEFT JOIN public.usuarios u ON u.id = o.autor_id
+      WHERE o.chamado_id = $1
+      ORDER BY o.criado_em ASC
+      `,
+      [id]
+    );
+
+    res.json({ ...chamado, observacoes: obs.rows });
+  } catch (e:any) {
+    console.error(e);
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+chamadosRouter.patch("/chamados/:id/checklist", async (req, res) => {
+  try {
+    const id = String(req.params.id);
+    const body = req.body || {};
+    const userEmail = String(body.userEmail || (req as any)?.user?.email || '').trim().toLowerCase();
+
+    if (!Array.isArray(body.checklist)) {
+      return res.status(400).json({ error: "checklist (array) Ã© obrigatÃ³rio." });
+    }
+    const newChecklist = body.checklist.map((x: any) => ({
+      item: String(x?.item || '').trim(),
+      resposta: (String(x?.resposta || 'sim').toLowerCase() === 'nao') ? 'nao' : 'sim',
+    }));
+
+    // 1) Busca chamado + checklist atual + mÃ¡quina
+    const { rows } = await pool.query(
+      `SELECT c.id, c.maquina_id, c.tipo, c.checklist
+         FROM public.chamados c
+        WHERE c.id = $1
+        LIMIT 1`,
+      [id]
+    );
+    if (!rows.length) return res.status(404).json({ error: "Chamado nÃ£o encontrado." });
+
+    const chamado = rows[0];
+    if (chamado.tipo !== 'preventiva') {
+      return res.status(400).json({ error: "Checklist sÃ³ Ã© editÃ¡vel em chamados 'preventiva'." });
+    }
+
+    const oldChecklist: Array<{item: string, resposta: string}> = Array.isArray(chamado.checklist)
+      ? chamado.checklist
+      : [];
+
+    // Mapa do estado anterior para detectar transiÃ§Ã£o sim->nao
+    const oldMap = new Map<string, string>();
+    for (const it of oldChecklist) {
+      const key = slugifyItem(it?.item || '');
+      oldMap.set(key, String(it?.resposta || 'sim').toLowerCase());
+    }
+
+    // 2) Atualiza o checklist no chamado
+    await pool.query(
+      `UPDATE public.chamados
+          SET checklist = $2::jsonb
+        WHERE id = $1`,
+      [id, JSON.stringify(newChecklist)]
+    );
+
+    // 3) Para cada item que virou "nao", cria corretiva (evitando duplicatas)
+    //    Quem cria? o userEmail (se existir em usuarios)
+    let criadoPorId: string | null = null;
+    if (userEmail) {
+      const u = await pool.query(`SELECT id FROM public.usuarios WHERE LOWER(email)=LOWER($1) LIMIT 1`, [userEmail]);
+      criadoPorId = u.rows?.[0]?.id ?? null;
+    }
+
+    const maquinaId = chamado.maquina_id;
+    let corretivasGeradas = 0;
+
+    for (const it of newChecklist) {
+      const key = slugifyItem(it.item);
+      const was = oldMap.get(key) || 'sim';
+      const now = it.resposta;
+
+      // sÃ³ abre corretiva na transiÃ§Ã£o sim -> nao
+      if (was !== 'nao' && now === 'nao' && it.item) {
+        // jÃ¡ existe corretiva aberta/andamento para este item desta mÃ¡quina?
+        const dup = await pool.query(
+          `SELECT 1 FROM public.chamados
+            WHERE maquina_id = $1
+              AND tipo = 'corretiva'
+              AND status IN ('Aberto','Em Andamento')
+              AND item = $2
+            LIMIT 1`,
+          [maquinaId, it.item]
+        );
+        if (dup.rowCount) continue;
+
+        const descricao = `Preventiva: item "${it.item}" marcado como NÃƒO.`;
+        await pool.query(
+          `INSERT INTO public.chamados
+             (maquina_id, tipo, status, descricao, item, criado_por_id, responsavel_atual_id)
+           VALUES ($1, 'corretiva', 'Aberto', $2, $3, $4, $4)`,
+          [maquinaId, descricao, it.item, criadoPorId]
+        );
+        corretivasGeradas++;
+      }
+    }
+
+    try { sseBroadcast?.({ topic: 'chamados', action: 'updated', id }); } catch {}
+
+    res.json({ ok: true, corretivasGeradas });
+  } catch (e:any) {
+    console.error(e);
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// ---------- Chamados: criar ----------
+/**
+ * Body:
+ * {
+ *   "maquinaTag": "TCN-12"   // ou "maquinaNome": "TCN-12"
+ *   "descricao": "texto...",
+ *   "tipo": "corretiva" | "preventiva",      // padrÃ£o: "corretiva"
+ *   "status": "Aberto" | "Em Andamento"      (padrÃ£o: "Aberto")
+ *   "criadoPorEmail": "operador@local",
+ *   "manutentorEmail": "manutentor@local"    // obrigatÃ³rio se status = "Em Andamento"
+ * }
+ *
+ * Regras:
+ * - operador pode criar SOMENTE "Aberto" (sem manutentorEmail)
+ * - manutentor/gestor podem criar "Aberto" ou "Em Andamento"
+ */
+chamadosRouter.post("/chamados", async (req, res) => {
+  try {
+    const user = (req as any).user as { role?: string; email?: string } | undefined;
+
+    const {
+      // identificaÃ§Ã£o da mÃ¡quina (opcional se vier de agendamento)
+      maquinaTag,
+      maquinaNome,
+
+      // descriÃ§Ã£o do problema
+      descricao,
+
+      // status inicial
+      status = "Aberto",
+
+      // quem cria / quem assume
+      criadoPorEmail,
+      manutentorEmail,
+
+      // NOVO: abertura a partir de agendamento preventivo
+      agendamentoId,
+
+      // NOVO: fallback â€“ se quiser passar diretamente um array de strings
+      checklistItems,
+    } = req.body ?? {};
+
+    // tipo: padrÃ£o 'corretiva', mas aceita 'preventiva'
+    const tipo = String(req.body?.tipo || "corretiva").toLowerCase() === "preventiva"
+      ? "preventiva"
+      : "corretiva";
+
+    // validaÃ§Ãµes bÃ¡sicas
+    if (!descricao || String(descricao).trim().length < 5) {
+      return res.status(400).json({ error: "DescriÃ§Ã£o Ã© obrigatÃ³ria (>= 5 caracteres)." });
+    }
+    if (!criadoPorEmail) {
+      return res.status(400).json({ error: "criadoPorEmail Ã© obrigatÃ³rio." });
+    }
+    if (!["Aberto", "Em Andamento"].includes(status)) {
+      return res.status(400).json({ error: "Status invÃ¡lido." });
+    }
+
+    // RBAC simples: operador sÃ³ cria 'Aberto' e nÃ£o pode atribuir
+    const role = user?.role ?? "gestor";
+    if (role === "operador") {
+      if (status !== "Aberto") {
+        return res.status(403).json({ error: "Operador sÃ³ pode criar chamados em 'Aberto'." });
+      }
+      if (manutentorEmail) {
+        return res.status(403).json({ error: "Operador nÃ£o pode atribuir manutentor ao criar." });
+      }
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // 1) Se for abertura por agendamento, buscamos os dados do agendamento e preparamos checklist
+    // ------------------------------------------------------------------------------------------
+    let maquinaIdFromAg: string | null = null;
+    let checklistFromAg: any[] = [];
+
+    if (agendamentoId) {
+      const { rows: ags } = await pool.query(
+        `SELECT a.id, a.maquina_id,
+                COALESCE(a.itens_checklist, '[]'::jsonb) AS itens_checklist
+           FROM public.agendamentos_preventivos a
+          WHERE a.id = $1
+          LIMIT 1`,
+        [agendamentoId]
+      );
+      if (!ags.length) {
+        return res.status(400).json({ error: "agendamentoId invÃ¡lido." });
+      }
+      maquinaIdFromAg = ags[0].maquina_id;
+
+      // monta [{item, resposta:'sim'}] a partir do array de strings
+      if (Array.isArray(ags[0].itens_checklist)) {
+        checklistFromAg = ags[0].itens_checklist.map((t: any) => ({
+          item: String(t),
+          resposta: "sim",
+        }));
+      }
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // 2) Se vier checklistItems direto no body, tambÃ©m aceitamos
+    // ------------------------------------------------------------------------------------------
+    let checklistFinal: any[] = [];
+    if (Array.isArray(checklistItems) && checklistItems.length) {
+      checklistFinal = checklistItems.map((t: any) => ({
+        item: String(t),
+        resposta: "sim",
+      }));
+    } else if (checklistFromAg.length) {
+      checklistFinal = checklistFromAg;
+    } else {
+      checklistFinal = []; // sem checklist
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // 3) Resolve mÃ¡quina: por agendamento OU por tag/nome
+    // ------------------------------------------------------------------------------------------
+    // Se nÃ£o veio por agendamento, precisa de maquinaTag/maquinaNome
+    if (!maquinaIdFromAg && !maquinaTag && !maquinaNome) {
+      return res.status(400).json({ error: "Informe maquinaTag ou maquinaNome (ou agendamentoId)." });
+    }
+
+    // Busca ids de UsuÃ¡rios e mÃ¡quina
+    const { rows: uCriador } = await pool.query(
+      `SELECT id FROM public.usuarios WHERE LOWER(email) = LOWER($1) LIMIT 1`,
+      [criadoPorEmail]
+    );
+    if (!uCriador.length) {
+      return res.status(400).json({ error: "criadoPorEmail invÃ¡lido." });
+    }
+
+    let manutentorId: string | null = null;
+    if (status === "Em Andamento" && manutentorEmail) {
+      const { rows: uMant } = await pool.query(
+        `SELECT id FROM public.usuarios WHERE LOWER(email) = LOWER($1) LIMIT 1`,
+        [manutentorEmail]
+      );
+      if (!uMant.length) {
+        return res.status(400).json({ error: "manutentorEmail invÃ¡lido." });
+      }
+      manutentorId = uMant[0].id;
+    }
+
+    // MÃ¡quina via (tag|nome) quando nÃ£o veio de agendamento
+    let maquinaId: string | null = maquinaIdFromAg;
+    if (!maquinaId) {
+      const { rows: maq } = await pool.query(
+        `SELECT id FROM public.maquinas
+          WHERE ($1::text IS NOT NULL AND tag = $1)
+             OR ($2::text IS NOT NULL AND nome = $2)
+          LIMIT 1`,
+        [maquinaTag ?? null, maquinaNome ?? null]
+      );
+      if (!maq.length) {
+        return res.status(400).json({ error: "MÃ¡quina nÃ£o encontrada (tag/nome)." });
+      }
+      maquinaId = maq[0].id;
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // 4) INSERT do chamado (inclui checklist jsonb). responsÃ¡vel inicial = manutentor (se Em Andamento)
+    // ------------------------------------------------------------------------------------------
+    const { rows: created } = await pool.query(
+      `INSERT INTO public.chamados
+         (maquina_id, tipo, status, descricao,
+          criado_por_id, manutentor_id, responsavel_atual_id,
+          checklist)
+       VALUES ($1, $2, $3, $4,
+               $5, $6, $7,
+               $8::jsonb)
+       RETURNING id`,
+      [
+        maquinaId,
+        tipo,                 // 'corretiva' | 'preventiva'
+        status,               // 'Aberto' | 'Em Andamento'
+        String(descricao).trim(),
+        uCriador[0].id,
+        manutentorId,
+        manutentorId,         // se Em Andamento, fica como responsÃ¡vel
+        JSON.stringify(checklistFinal),
+      ]
+    );
+
+    const chamadoId = created[0].id;
+
+    // (opcional) se veio de agendamento, marque como iniciado
+    if (agendamentoId) {
+      await pool.query(
+        `UPDATE public.agendamentos_preventivos
+            SET status = 'iniciado', iniciado_em = NOW()
+          WHERE id = $1`,
+        [agendamentoId]
+      );
+    }
+
+    // retorna o formato que sua lista jÃ¡ espera
+    const { rows } = await pool.query(
+      `SELECT
+         c.id,
+         m.nome  AS maquina,
+         c.tipo,
+         c.status,
+         c.descricao,
+         u.nome  AS criado_por,
+         um.nome AS manutentor,
+         to_char(c.criado_em, 'YYYY-MM-DD HH24:MI') AS criado_em
+       FROM public.chamados c
+       JOIN public.maquinas  m  ON m.id  = c.maquina_id
+       JOIN public.usuarios  u  ON u.id  = c.criado_por_id
+       LEFT JOIN public.usuarios um ON um.id = c.manutentor_id
+       WHERE c.id = $1`,
+      [chamadoId]
+    );
+
+    try { sseBroadcast?.({ topic: "chamados", action: "created", id: chamadoId }); } catch {}
+
+    res.status(201).json(rows[0]);
+  } catch (e:any) {
+    console.error(e);
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// ---------- Chamados: atualizar status ----------
+/**
+ * Body:
+ * {
+ *   "status": "Aberto" | "Em Andamento" | "ConcluÃ­do",
+ *   "manutentorEmail": "manutentor@local"  // obrigatÃ³rio se status = "Em Andamento"
+ * }
+ *
+ * Regras:
+ * - "Em Andamento": manutentor/gestor
+ * - "ConcluÃ­do":    manutentor/gestor
+ * - "Aberto":       gestor
+ */
+chamadosRouter.patch("/chamados/:id", async (req, res) => {
+  try {
+    const user = (req as any).user as { role?: string; email?: string } | undefined;
+    const role = user?.role ?? "gestor"; // ambiente dev: default libera
+
+    const id = String(req.params.id);
+    const { status, manutentorEmail } = req.body ?? {};
+
+    if (!["Aberto", "Em Andamento", "ConcluÃ­do"].includes(status)) {
+      return res.status(400).json({ error: "Status invÃ¡lido." });
+    }
+
+    if (status === "Em Andamento") {
+      if (!(role === "manutentor" || role === "gestor")) {
+        return res
+          .status(403)
+          .json({ error: "Apenas manutentor/gestor podem mover para 'Em Andamento'." });
+      }
+      if (!manutentorEmail) {
+        return res
+          .status(400)
+          .json({ error: "manutentorEmail Ã© obrigatÃ³rio quando status = 'Em Andamento'." });
+      }
+    }
+
+    if (status === "ConcluÃ­do") {
+      if (!(role === "manutentor" || role === "gestor")) {
+        return res.status(403).json({ error: "Apenas manutentor/gestor podem concluir." });
+      }
+    }
+
+    if (status === "Aberto") {
+      if (role !== "gestor") {
+        return res.status(403).json({ error: "Apenas gestor pode reabrir para 'Aberto'." });
+      }
+    }
+
+    const sql = `
+      WITH mt AS (
+        SELECT id FROM usuarios WHERE email = $2 LIMIT 1
+      )
+      UPDATE chamados c
+      SET
+        status = $1,
+        manutentor_id = CASE
+          WHEN $1 = 'Em Andamento' THEN (SELECT id FROM mt)
+          WHEN $1 = 'Aberto' THEN NULL
+          ELSE c.manutentor_id
+        END,
+        responsavel_atual_id = CASE
+          WHEN $1 = 'Em Andamento' THEN (SELECT id FROM mt)
+          WHEN $1 = 'Aberto' THEN NULL
+          ELSE c.responsavel_atual_id
+        END,
+        atualizado_em = NOW()
+      WHERE c.id = $3
+      RETURNING c.id;
+    `;
+
+    const upd = await pool.query(sql, [status, manutentorEmail ?? null, id]);
+    if (upd.rowCount === 0) {
+      return res.status(404).json({ error: "Chamado nÃ£o encontrado ou manutentor inexistente." });
+    }
+
+    const { rows } = await pool.query(
+      `SELECT
+         c.id, m.nome AS maquina, c.tipo, c.status, c.descricao,
+         u.nome AS criado_por, um.nome AS manutentor,
+         to_char(c.criado_em, 'YYYY-MM-DD HH24:MI') AS criado_em
+       FROM chamados c
+       JOIN maquinas  m  ON m.id  = c.maquina_id
+       JOIN usuarios  u  ON u.id  = c.criado_por_id
+       LEFT JOIN usuarios um ON um.id = c.manutentor_id
+       WHERE c.id = $1`,
+      [id]
+    );
+
+    // SSE broadcast
+    sseBroadcast({ topic: "chamados", action: "updated", id });
+
+    res.json(rows[0]);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+
