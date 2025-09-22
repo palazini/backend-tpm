@@ -1,6 +1,8 @@
 ﻿import { Router } from 'express';
-import { pool } from '../db';
+import { requireRole } from '../middlewares/requireRole';
+import { pool, withTx } from '../db';
 import { slugifyItem } from '../utils/slug';
+import { CHAMADO_STATUS, normalizeChamadoStatus } from '../utils/status';
 import { sseBroadcast } from '../utils/sse';
 
 export const chamadosRouter = Router();
@@ -227,6 +229,291 @@ chamadosRouter.get("/chamados/:id", async (req, res) => {
     res.status(500).json({ error: String(e) });
   }
 });
+
+// ---------- Chamados: observacoes ----------
+chamadosRouter.post(
+  "/chamados/:id/observacoes",
+  requireRole(['operador', 'manutentor', 'gestor']),
+  async (req, res) => {
+    try {
+      const chamadoId = String(req.params.id);
+      const texto = String(req.body?.texto ?? '').trim();
+      if (!texto) {
+        return res.status(400).json({ error: 'TEXTO_OBRIGATORIO' });
+      }
+
+      const user = req.user;
+      const autorId = user?.id ?? null;
+      const autorNome = user?.name ? String(user.name).trim() : user?.email ? String(user.email).trim() : null;
+
+      const { rows } = await pool.query(
+        `INSERT INTO public.chamado_observacoes
+           (chamado_id, autor_id, autor_nome, texto, criado_em)
+         VALUES ($1, $2, $3, $4, NOW())
+         RETURNING id, texto, criado_em`,
+        [chamadoId, autorId, autorNome, texto]
+      );
+
+      const observacao = rows[0];
+
+      const { rows: lista } = await pool.query(
+        `SELECT
+           COALESCE(o.texto, o.mensagem, '')        AS texto,
+           to_char(o.criado_em, 'YYYY-MM-DD HH24:MI') AS criado_em,
+           COALESCE(o.autor_nome, u.nome, 'Sistema') AS autor
+         FROM public.chamado_observacoes o
+         LEFT JOIN public.usuarios u ON u.id = o.autor_id
+        WHERE o.chamado_id = $1
+        ORDER BY o.criado_em ASC`,
+        [chamadoId]
+      );
+
+      const ultimaObservacao = lista[lista.length - 1] ?? observacao;
+
+      try {
+        sseBroadcast?.({
+          topic: 'chamados',
+          action: 'observacao-criada',
+          id: chamadoId,
+          payload: ultimaObservacao,
+        });
+      } catch {}
+
+      return res.status(201).json({ ok: true, observacao: ultimaObservacao, observacoes: lista });
+    } catch (error) {
+      if ((error as any)?.code === '23503') {
+        return res.status(404).json({ error: 'CHAMADO_NAO_ENCONTRADO' });
+      }
+      console.error(error);
+      return res.status(500).json({ error: String(error) });
+    }
+  }
+);
+
+// ---------- Chamados: atender ----------
+chamadosRouter.post(
+  "/chamados/:id/atender",
+  requireRole(['manutentor', 'gestor']),
+  async (req, res) => {
+    try {
+      const user = req.user;
+      if (!user?.id) {
+        return res.status(401).json({ error: 'USUARIO_NAO_CADASTRADO' });
+      }
+
+      const chamadoId = String(req.params.id);
+
+      const resultado = await withTx(async (client) => {
+        const { rows } = await client.query(
+          `SELECT status,
+                  tipo,
+                  manutentor_id,
+                  responsavel_atual_id,
+                  atendido_por_id,
+                  agendamento_id
+             FROM public.chamados
+            WHERE id = $1
+            FOR UPDATE`,
+          [chamadoId]
+        );
+
+        if (!rows.length) {
+          return { notFound: true as const };
+        }
+
+        const atual = rows[0];
+        const statusAtual = normalizeChamadoStatus(atual.status);
+        if (statusAtual !== CHAMADO_STATUS.ABERTO) {
+          return { conflict: atual.status as string };
+        }
+
+        const atendenteEmail = user.email ? String(user.email).trim() : null;
+        const atendenteNome = user.name ? String(user.name).trim() : null;
+
+        const { rows: updated } = await client.query(
+          `UPDATE public.chamados
+              SET status = $2,
+                  manutentor_id = COALESCE(manutentor_id, $3),
+                  responsavel_atual_id = $3,
+                  atendido_por_id = $3,
+                  atendido_por_email = $4,
+                  atendido_por_nome = $5,
+                  atendido_em = NOW(),
+                  atualizado_em = NOW()
+            WHERE id = $1
+          RETURNING id, status, manutentor_id, responsavel_atual_id, atendido_por_id, agendamento_id`,
+          [chamadoId, CHAMADO_STATUS.EM_ANDAMENTO, user.id, atendenteEmail, atendenteNome]
+        );
+
+        if (!updated.length) {
+          return { conflict: atual.status as string };
+        }
+
+        return { row: updated[0] };
+      });
+
+      if (resultado.notFound) {
+        return res.status(404).json({ error: 'CHAMADO_NAO_ENCONTRADO' });
+      }
+
+      if (resultado.conflict) {
+        return res.status(409).json({ error: 'STATE_CONFLICT', status: resultado.conflict });
+      }
+
+      try {
+        sseBroadcast?.({ topic: 'chamados', action: 'updated', id: chamadoId });
+      } catch {}
+
+      return res.json({ ok: true, chamado: resultado.row });
+    } catch (error) {
+      console.error(error);
+      return res.status(500).json({ error: String(error) });
+    }
+  }
+);
+
+// ---------- Chamados: concluir ----------
+chamadosRouter.post(
+  "/chamados/:id/concluir",
+  requireRole(['manutentor', 'gestor']),
+  async (req, res) => {
+    try {
+      const user = req.user;
+      if (!user?.id) {
+        return res.status(401).json({ error: 'USUARIO_NAO_CADASTRADO' });
+      }
+
+      const chamadoId = String(req.params.id);
+      const body = req.body ?? {};
+
+      const { rows } = await pool.query(
+        `SELECT status,
+                tipo,
+                manutentor_id,
+                responsavel_atual_id,
+                atendido_por_id,
+                agendamento_id,
+                checklist
+           FROM public.chamados
+          WHERE id = $1`,
+        [chamadoId]
+      );
+
+      if (!rows.length) {
+        return res.status(404).json({ error: 'CHAMADO_NAO_ENCONTRADO' });
+      }
+
+      const atual = rows[0];
+      const statusAtual = normalizeChamadoStatus(atual.status);
+      if (statusAtual !== CHAMADO_STATUS.EM_ANDAMENTO) {
+        return res.status(409).json({ error: 'STATE_CONFLICT', status: atual.status });
+      }
+
+      const associados = [atual.manutentor_id, atual.responsavel_atual_id, atual.atendido_por_id]
+        .filter(Boolean)
+        .map((value) => String(value));
+      if (user.role !== 'gestor' && !associados.includes(String(user.id))) {
+        return res.status(403).json({ error: 'PERMISSAO_NEGADA' });
+      }
+
+      const tipoChamado = typeof atual.tipo === 'string' ? atual.tipo.toLowerCase() : '';
+
+      let checklistJson: string | null = null;
+      if (tipoChamado === 'preventiva') {
+        if (!Array.isArray(body.checklist)) {
+          return res.status(400).json({ error: 'CHECKLIST_OBRIGATORIO' });
+        }
+        const normalizedChecklist = body.checklist
+          .map((item: any) => {
+            const texto = String(item?.item ?? item ?? '').trim();
+            if (!texto) return null;
+            const respostaRaw = String(item?.resposta ?? item?.status ?? 'sim').toLowerCase();
+            const resposta = respostaRaw.startsWith('n') ? 'nao' : 'sim';
+            return { item: texto, resposta };
+          })
+          .filter(Boolean);
+        if (!normalizedChecklist.length) {
+          return res.status(400).json({ error: 'CHECKLIST_OBRIGATORIO' });
+        }
+        checklistJson = JSON.stringify(normalizedChecklist);
+      } else if (Array.isArray(body.checklist)) {
+        const normalizedChecklist = body.checklist
+          .map((item: any) => {
+            const texto = String(item?.item ?? item ?? '').trim();
+            if (!texto) return null;
+            const respostaRaw = String(item?.resposta ?? item?.status ?? 'sim').toLowerCase();
+            const resposta = respostaRaw.startsWith('n') ? 'nao' : 'sim';
+            return { item: texto, resposta };
+          })
+          .filter(Boolean);
+        checklistJson = normalizedChecklist.length ? JSON.stringify(normalizedChecklist) : null;
+      }
+
+      let causaFinal: string | null = null;
+      let solucaoFinal: string | null = null;
+
+      if (tipoChamado === 'corretiva') {
+        if (typeof body.causa !== 'string' || !body.causa.trim()) {
+          return res.status(400).json({ error: 'CAUSA_OBRIGATORIA' });
+        }
+        if (typeof body.solucao !== 'string' || !body.solucao.trim()) {
+          return res.status(400).json({ error: 'SOLUCAO_OBRIGATORIA' });
+        }
+        causaFinal = body.causa.trim();
+        solucaoFinal = body.solucao.trim();
+      } else {
+        causaFinal = typeof body.causa === 'string' ? body.causa.trim() || null : null;
+        solucaoFinal = typeof body.solucao === 'string' ? body.solucao.trim() || null : null;
+      }
+
+      const chamadoAtualizado = await withTx(async (client) => {
+        const { rows: updated } = await client.query(
+          `UPDATE public.chamados
+              SET status = $2,
+                  concluido_em = NOW(),
+                  checklist = COALESCE($3::jsonb, checklist),
+                  causa = COALESCE($4::text, causa),
+                  solucao = COALESCE($5::text, solucao),
+                  atualizado_em = NOW()
+            WHERE id = $1
+          RETURNING id, status, tipo, agendamento_id`,
+          [chamadoId, CHAMADO_STATUS.CONCLUIDO, checklistJson, causaFinal, solucaoFinal]
+        );
+
+        if (!updated.length) {
+          return null;
+        }
+
+        const chamadoRow = updated[0];
+
+        if (chamadoRow.agendamento_id) {
+          await client.query(
+            `UPDATE public.agendamentos_preventivos
+                SET status = 'concluido',
+                    concluido_em = NOW()
+              WHERE id = $1`,
+            [chamadoRow.agendamento_id]
+          );
+        }
+
+        return chamadoRow;
+      });
+
+      if (!chamadoAtualizado) {
+        return res.status(500).json({ error: 'FALHA_ATUALIZAR_CHAMADO' });
+      }
+
+      try {
+        sseBroadcast?.({ topic: 'chamados', action: 'updated', id: chamadoId });
+      } catch {}
+
+      return res.json({ ok: true, chamado: chamadoAtualizado });
+    } catch (error) {
+      console.error(error);
+      return res.status(500).json({ error: String(error) });
+    }
+  }
+);
 
 chamadosRouter.patch("/chamados/:id/checklist", async (req, res) => {
   try {
