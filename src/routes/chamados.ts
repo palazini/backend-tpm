@@ -1,4 +1,4 @@
-import { Router } from 'express';
+﻿import { Router } from 'express';
 import { requireRole } from '../middlewares/requireRole';
 import { pool, withTx } from '../db';
 import { slugifyItem } from '../utils/slug';
@@ -170,9 +170,12 @@ chamadosRouter.get("/chamados/:id", async (req, res) => {
         ucri.email                                AS criado_por_email,
 
         -- Manutentor (quem atendeu)
-        c.atendido_por_id,
-        COALESCE(c.atendido_por_nome, umat.nome) AS manutentor,
-        umat.email                                AS manutentor_email,
+         c.atendido_por_id,
+         c.atendido_por_nome,
+         c.atendido_por_email,
+         to_char(c.atendido_em, 'YYYY-MM-DD HH24:MI') AS atendido_em,
+         COALESCE(c.atendido_por_nome, umat.nome)     AS manutentor,
+         COALESCE(c.atendido_por_email, umat.email)   AS manutentor_email,
 
         -- Atribuído (histórico da importação)
         c.atribuido_para_id,
