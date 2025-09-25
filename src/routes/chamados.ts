@@ -1,4 +1,4 @@
-﻿import { Router } from 'express';
+import { Router } from 'express';
 import { requireRole } from '../middlewares/requireRole';
 import { pool, withTx } from '../db';
 import { slugifyItem } from '../utils/slug';
@@ -7,7 +7,7 @@ import { sseBroadcast } from '../utils/sse';
 
 export const chamadosRouter = Router();
 
-// ---------- Chamados: lista com filtros + paginaÃ§Ã£o ----------
+// ---------- Chamados: lista com filtros + paginação ----------
 chamadosRouter.get("/chamados", async (req, res) => {
   try {
     const status          = req.query.status as string | undefined;
@@ -26,17 +26,16 @@ chamadosRouter.get("/chamados", async (req, res) => {
     const params: any[] = [];
     const where: string[] = [];
 
-    // status (robusto p/ "ConcluÃ­do", "Concluido", "concluido"...)
+    // status (robusto p/ "Concluído", "Concluido", "concluido"...)
     let isConcluido = false;
     if (status) {
-      const s = status.toLowerCase();
-      if (s.startsWith("conclu")) {
-        isConcluido = true;
-        where.push(`LOWER(c.status) LIKE 'conclu%'`);
-      } else {
-        params.push(status);
-        where.push(`LOWER(c.status) = LOWER($${params.length})`);
+      const statusNorm = normalizeChamadoStatus(status);
+      if (!statusNorm) {
+        return res.status(400).json({ error: 'STATUS_INVALIDO' });
       }
+      params.push(statusNorm);
+      where.push(`LOWER(c.status) = LOWER($${params.length})`);
+      isConcluido = (statusNorm === CHAMADO_STATUS.CONCLUIDO);
     }
 
     // tipo (case-insensitive)
@@ -61,7 +60,7 @@ chamadosRouter.get("/chamados", async (req, res) => {
       where.push(`LOWER(u.email) = LOWER($${params.length})`);
     }
 
-    // manutentor: cobre manutentor_id E colunas de atribuiÃ§Ã£o por e-mail (se existirem)
+    // manutentor: cobre manutentor_id E colunas de atribuição por e-mail (se existirem)
     if (manutentorEmail) {
       params.push(manutentorEmail);
       const idx = params.length;
@@ -73,7 +72,7 @@ chamadosRouter.get("/chamados", async (req, res) => {
       `);
     }
 
-    // PerÃ­odo: se ConcluÃ­do, filtra por concluido_em; senÃ£o por criado_em
+    // Período: se Concluído, filtra por concluido_em; senão por criado_em
     const dateCol = isConcluido ? "c.concluido_em" : "c.criado_em";
     if (from) {
       params.push(new Date(from).toISOString());
@@ -132,12 +131,12 @@ chamadosRouter.get("/chamados", async (req, res) => {
   }
 });
 
-// ---------- Chamados: detalhe (patch 3 - versÃ£o completa) ----------
+// ---------- Chamados: detalhe (patch 3 - versão completa) ----------
 chamadosRouter.get("/chamados/:id", async (req, res) => {
   try {
     const id = String(req.params.id);
 
-    // Detalhe do chamado + responsÃ¡vel atual
+    // Detalhe do chamado + responsável atual
     const { rows } = await pool.query(
       `
       SELECT
@@ -146,18 +145,26 @@ chamadosRouter.get("/chamados/:id", async (req, res) => {
         m.nome AS maquina,
         c.tipo,
         c.status,
+        CASE
+          WHEN LOWER(c.status) LIKE 'abert%'       THEN 'aberto'
+          WHEN LOWER(c.status) LIKE 'em andament%' THEN 'em_andamento'
+          WHEN LOWER(c.status) LIKE 'conclu%'      THEN 'concluido'
+          WHEN LOWER(c.status) LIKE 'cancel%'      THEN 'cancelado'
+          ELSE 'aberto'
+        END AS status_key,
 
-        -- Texto / serviÃ§o
+        -- Texto / serviço
         c.descricao,
         c.problema_reportado,
         c.causa,
+        COALESCE(c.solucao, c.servico_realizado) AS solucao,
         COALESCE(c.servico_realizado, c.solucao) AS servico_realizado,
 
         -- Datas
         to_char(c.criado_em,    'YYYY-MM-DD HH24:MI') AS criado_em,
         to_char(c.concluido_em, 'YYYY-MM-DD HH24:MI') AS concluido_em,
 
-        -- Quem criou
+        -- quem criou
         c.criado_por_id,
         COALESCE(c.criado_por_nome, ucri.nome)   AS criado_por,
         ucri.email                                AS criado_por_email,
@@ -167,27 +174,32 @@ chamadosRouter.get("/chamados/:id", async (req, res) => {
         COALESCE(c.atendido_por_nome, umat.nome) AS manutentor,
         umat.email                                AS manutentor_email,
 
-        -- AtribuÃ­do (histÃ³rico da importaÃ§Ã£o)
+        -- Atribuído (histórico da importação)
         c.atribuido_para_id,
         c.atribuido_para_nome,
         c.atribuido_para_email,
 
-        -- responsÃ¡vel atual (o que a UI mostra como AtribuÃ­do a)
+        -- Responsável atual (o que a UI mostra como Atribuído a)
         c.responsavel_atual_id,
         ru.nome   AS responsavel_atual_nome,
         ru.email  AS responsavel_atual_email,
 
-        -- ðŸ”½ Checklist âœ… sempre como JSONB (evita misturar text[]/array_agg)
-        COALESCE(c.checklist, '[]'::jsonb) AS checklist,
+        -- quem concluiu (novo)
+        c.concluido_por_id,
+        c.concluido_por_nome,
+        c.concluido_por_email,
+
+        -- Checklist sempre como JSONB
+        CASE WHEN jsonb_typeof(c.checklist) = 'array' THEN c.checklist ELSE '[]'::jsonb END AS checklist,
 
         -- Metadados do checklist
         CASE WHEN c.tipo = 'preventiva' THEN 'preventiva' ELSE NULL END AS tipo_checklist,
         CASE WHEN c.tipo = 'preventiva' AND c.checklist IS NOT NULL
-             THEN jsonb_array_length(c.checklist)
-             ELSE NULL
+            THEN jsonb_array_length(c.checklist)
+            ELSE NULL
         END AS qtd_itens,
 
-        -- Aliases normalizados para facilitar no front
+        -- Aliases normalizados p/ o front
         COALESCE(c.responsavel_atual_id, c.atendido_por_id, c.atribuido_para_id)     AS manutentor_id_norm,
         COALESCE(ru.email,                umat.email,        c.atribuido_para_email) AS manutentor_email_norm,
         COALESCE(ru.nome,                 umat.nome,         c.atribuido_para_nome)  AS manutentor_nome_norm
@@ -204,11 +216,11 @@ chamadosRouter.get("/chamados/:id", async (req, res) => {
     );
 
     if (!rows.length) {
-      return res.status(404).json({ error: "Chamado nÃ£o encontrado." });
+      return res.status(404).json({ error: "Chamado não encontrado." });
     }
     const chamado = rows[0];
 
-    // ObservaÃ§Ãµes (texto sempre string; sem arrays SQL)
+    // Observações (texto sempre string; sem arrays SQL)
     const obs = await pool.query(
       `
       SELECT
@@ -409,15 +421,17 @@ chamadosRouter.post(
         return res.status(409).json({ error: 'STATE_CONFLICT', status: atual.status });
       }
 
+      // Permissão: quem pode concluir (atendente/resp/manutentor) ou gestor
       const associados = [atual.manutentor_id, atual.responsavel_atual_id, atual.atendido_por_id]
         .filter(Boolean)
-        .map((value) => String(value));
+        .map((v) => String(v));
       if (user.role !== 'gestor' && !associados.includes(String(user.id))) {
         return res.status(403).json({ error: 'PERMISSAO_NEGADA' });
       }
 
       const tipoChamado = typeof atual.tipo === 'string' ? atual.tipo.toLowerCase() : '';
 
+      // Normalização de checklist (se vier no body)
       let checklistJson: string | null = null;
       if (tipoChamado === 'preventiva') {
         if (!Array.isArray(body.checklist)) {
@@ -437,6 +451,7 @@ chamadosRouter.post(
         }
         checklistJson = JSON.stringify(normalizedChecklist);
       } else if (Array.isArray(body.checklist)) {
+        // se passar checklist em corretiva, não é erro - apenas armazenamos
         const normalizedChecklist = body.checklist
           .map((item: any) => {
             const texto = String(item?.item ?? item ?? '').trim();
@@ -449,9 +464,9 @@ chamadosRouter.post(
         checklistJson = normalizedChecklist.length ? JSON.stringify(normalizedChecklist) : null;
       }
 
+      // Causa/Solução
       let causaFinal: string | null = null;
       let solucaoFinal: string | null = null;
-
       if (tipoChamado === 'corretiva') {
         if (typeof body.causa !== 'string' || !body.causa.trim()) {
           return res.status(400).json({ error: 'CAUSA_OBRIGATORIA' });
@@ -462,50 +477,99 @@ chamadosRouter.post(
         causaFinal = body.causa.trim();
         solucaoFinal = body.solucao.trim();
       } else {
-        causaFinal = typeof body.causa === 'string' ? body.causa.trim() || null : null;
+        causaFinal   = typeof body.causa   === 'string' ? body.causa.trim()   || null : null;
         solucaoFinal = typeof body.solucao === 'string' ? body.solucao.trim() || null : null;
       }
 
       const chamadoAtualizado = await withTx(async (client) => {
-        const { rows: updated } = await client.query(
-          `UPDATE public.chamados
-              SET status = $2,
-                  concluido_em = NOW(),
-                  checklist = COALESCE($3::jsonb, checklist),
-                  causa = COALESCE($4::text, causa),
-                  solucao = COALESCE($5::text, solucao),
-                  atualizado_em = NOW()
-            WHERE id = $1
-          RETURNING id, status, tipo, agendamento_id`,
-          [chamadoId, CHAMADO_STATUS.CONCLUIDO, checklistJson, causaFinal, solucaoFinal]
-        );
+        const paramsBase = {
+          concluidorId:    user.id,
+          concluidorEmail: user.email ?? null,
+          concluidorNome:  user.name  ?? null,
+        };
 
-        if (!updated.length) {
-          return null;
+        let qEnd;
+        if (tipoChamado === 'corretiva') {
+          qEnd = await client.query(
+            `
+            UPDATE public.chamados
+               SET status               = $2,
+                   concluido_em         = NOW(),
+                   checklist            = COALESCE($3::jsonb, checklist),
+                   causa                = COALESCE($4::text, causa),
+                   solucao              = COALESCE($5::text, solucao),
+                   servico_realizado    = COALESCE($5::text, servico_realizado),
+                   concluido_por_id     = $6,
+                   concluido_por_email  = $7,
+                   concluido_por_nome   = $8,
+                   atualizado_em        = NOW()
+             WHERE id = $1
+             RETURNING id, status, tipo, agendamento_id
+            `,
+            [
+              chamadoId,
+              CHAMADO_STATUS.CONCLUIDO,
+              checklistJson,
+              causaFinal,
+              solucaoFinal,
+              paramsBase.concluidorId,
+              paramsBase.concluidorEmail,
+              paramsBase.concluidorNome,
+            ]
+          );
+        } else {
+          // preventiva
+          qEnd = await client.query(
+            `
+            UPDATE public.chamados
+               SET status               = $2,
+                   concluido_em         = NOW(),
+                   checklist            = COALESCE($3::jsonb, checklist),
+                   causa                = COALESCE($4::text, causa),
+                   solucao              = COALESCE($5::text, solucao),
+                   concluido_por_id     = $6,
+                   concluido_por_email  = $7,
+                   concluido_por_nome   = $8,
+                   atualizado_em        = NOW()
+             WHERE id = $1
+             RETURNING id, status, tipo, agendamento_id
+            `,
+            [
+              chamadoId,
+              CHAMADO_STATUS.CONCLUIDO,
+              checklistJson,
+              causaFinal,
+              solucaoFinal,
+              paramsBase.concluidorId,
+              paramsBase.concluidorEmail,
+              paramsBase.concluidorNome,
+            ]
+          );
         }
 
-        const chamadoRow = updated[0];
+        if (!qEnd.rowCount) return null;
 
-        if (chamadoRow.agendamento_id) {
+        const row = qEnd.rows[0];
+
+        // Se houver vínculo de agendamento, marque concluído
+        if (row.agendamento_id) {
           await client.query(
             `UPDATE public.agendamentos_preventivos
                 SET status = 'concluido',
                     concluido_em = NOW()
               WHERE id = $1`,
-            [chamadoRow.agendamento_id]
+            [row.agendamento_id]
           );
         }
 
-        return chamadoRow;
+        return row;
       });
 
       if (!chamadoAtualizado) {
         return res.status(500).json({ error: 'FALHA_ATUALIZAR_CHAMADO' });
       }
 
-      try {
-        sseBroadcast?.({ topic: 'chamados', action: 'updated', id: chamadoId });
-      } catch {}
+      try { sseBroadcast?.({ topic: 'chamados', action: 'updated', id: chamadoId }); } catch {}
 
       return res.json({ ok: true, chamado: chamadoAtualizado });
     } catch (error) {
@@ -522,14 +586,14 @@ chamadosRouter.patch("/chamados/:id/checklist", async (req, res) => {
     const userEmail = String(body.userEmail || (req as any)?.user?.email || '').trim().toLowerCase();
 
     if (!Array.isArray(body.checklist)) {
-      return res.status(400).json({ error: "checklist (array) Ã© obrigatÃ³rio." });
+      return res.status(400).json({ error: "checklist (array) é obrigatório." });
     }
     const newChecklist = body.checklist.map((x: any) => ({
       item: String(x?.item || '').trim(),
       resposta: (String(x?.resposta || 'sim').toLowerCase() === 'nao') ? 'nao' : 'sim',
     }));
 
-    // 1) Busca chamado + checklist atual + mÃ¡quina
+    // 1) Busca chamado + checklist atual + máquina
     const { rows } = await pool.query(
       `SELECT c.id, c.maquina_id, c.tipo, c.checklist
          FROM public.chamados c
@@ -537,18 +601,18 @@ chamadosRouter.patch("/chamados/:id/checklist", async (req, res) => {
         LIMIT 1`,
       [id]
     );
-    if (!rows.length) return res.status(404).json({ error: "Chamado nÃ£o encontrado." });
+    if (!rows.length) return res.status(404).json({ error: "Chamado não encontrado." });
 
     const chamado = rows[0];
     if (chamado.tipo !== 'preventiva') {
-      return res.status(400).json({ error: "Checklist sÃ³ Ã© editÃ¡vel em chamados 'preventiva'." });
+      return res.status(400).json({ error: "Checklist só é editável em chamados 'preventiva'." });
     }
 
     const oldChecklist: Array<{item: string, resposta: string}> = Array.isArray(chamado.checklist)
       ? chamado.checklist
       : [];
 
-    // Mapa do estado anterior para detectar transiÃ§Ã£o sim->nao
+    // Mapa do estado anterior para detectar transição sim->nao
     const oldMap = new Map<string, string>();
     for (const it of oldChecklist) {
       const key = slugifyItem(it?.item || '');
@@ -564,7 +628,7 @@ chamadosRouter.patch("/chamados/:id/checklist", async (req, res) => {
     );
 
     // 3) Para cada item que virou "nao", cria corretiva (evitando duplicatas)
-    //    Quem cria? o userEmail (se existir em usuarios)
+    //    quem cria? o userEmail (se existir em usuarios)
     let criadoPorId: string | null = null;
     if (userEmail) {
       const u = await pool.query(`SELECT id FROM public.usuarios WHERE LOWER(email)=LOWER($1) LIMIT 1`, [userEmail]);
@@ -579,9 +643,9 @@ chamadosRouter.patch("/chamados/:id/checklist", async (req, res) => {
       const was = oldMap.get(key) || 'sim';
       const now = it.resposta;
 
-      // sÃ³ abre corretiva na transiÃ§Ã£o sim -> nao
+      // só abre corretiva na transição sim -> nao
       if (was !== 'nao' && now === 'nao' && it.item) {
-        // jÃ¡ existe corretiva aberta/andamento para este item desta mÃ¡quina?
+        // já existe corretiva aberta/andamento para este item desta máquina?
         const dup = await pool.query(
           `SELECT 1 FROM public.chamados
             WHERE maquina_id = $1
@@ -593,7 +657,7 @@ chamadosRouter.patch("/chamados/:id/checklist", async (req, res) => {
         );
         if (dup.rowCount) continue;
 
-        const descricao = `Preventiva: item "${it.item}" marcado como NÃƒO.`;
+        const descricao = `Preventiva: item "${it.item}" marcado como NÃO.`;
         await pool.query(
           `INSERT INTO public.chamados
              (maquina_id, tipo, status, descricao, item, criado_por_id, responsavel_atual_id)
@@ -619,10 +683,10 @@ chamadosRouter.patch("/chamados/:id/checklist", async (req, res) => {
  * {
  *   "maquinaTag": "TCN-12"   // ou "maquinaNome": "TCN-12"
  *   "descricao": "texto...",
- *   "tipo": "corretiva" | "preventiva",      // padrÃ£o: "corretiva"
- *   "status": "Aberto" | "Em Andamento"      (padrÃ£o: "Aberto")
+ *   "tipo": "corretiva" | "preventiva",      // padrão: "corretiva"
+ *   "status": "Aberto" | "Em Andamento"      (padrão: "Aberto")
  *   "criadoPorEmail": "operador@local",
- *   "manutentorEmail": "manutentor@local"    // obrigatÃ³rio se status = "Em Andamento"
+ *   "manutentorEmail": "manutentor@local"    // obrigatório se status = "Em Andamento"
  * }
  *
  * Regras:
@@ -634,11 +698,11 @@ chamadosRouter.post("/chamados", async (req, res) => {
     const user = (req as any).user as { role?: string; email?: string } | undefined;
 
     const {
-      // identificaÃ§Ã£o da mÃ¡quina (opcional se vier de agendamento)
+      // identificação da máquina (opcional se vier de agendamento)
       maquinaTag,
       maquinaNome,
 
-      // descriÃ§Ã£o do problema
+      // descrição do problema
       descricao,
 
       // status inicial
@@ -651,34 +715,35 @@ chamadosRouter.post("/chamados", async (req, res) => {
       // NOVO: abertura a partir de agendamento preventivo
       agendamentoId,
 
-      // NOVO: fallback â€“ se quiser passar diretamente um array de strings
+      // NOVO: fallback ?? "" se quiser passar diretamente um array de strings
       checklistItems,
     } = req.body ?? {};
 
-    // tipo: padrÃ£o 'corretiva', mas aceita 'preventiva'
+    const statusNorm = normalizeChamadoStatus(status) ?? CHAMADO_STATUS.ABERTO;
+    if (![CHAMADO_STATUS.ABERTO, CHAMADO_STATUS.EM_ANDAMENTO].includes(statusNorm)) {
+      return res.status(400).json({ error: "Status invalido para criacao." });
+    }
+
+    // tipo: padrão 'corretiva', mas aceita 'preventiva'
     const tipo = String(req.body?.tipo || "corretiva").toLowerCase() === "preventiva"
       ? "preventiva"
       : "corretiva";
 
-    // validaÃ§Ãµes bÃ¡sicas
+    // validações básicas
     if (!descricao || String(descricao).trim().length < 5) {
-      return res.status(400).json({ error: "DescriÃ§Ã£o Ã© obrigatÃ³ria (>= 5 caracteres)." });
+      return res.status(400).json({ error: "Descrição é obrigatória (>= 5 caracteres)." });
     }
     if (!criadoPorEmail) {
-      return res.status(400).json({ error: "criadoPorEmail Ã© obrigatÃ³rio." });
+      return res.status(400).json({ error: "criadoPorEmail é obrigatório." });
     }
-    if (!["Aberto", "Em Andamento"].includes(status)) {
-      return res.status(400).json({ error: "Status invÃ¡lido." });
-    }
-
-    // RBAC simples: operador sÃ³ cria 'Aberto' e nÃ£o pode atribuir
+    // RBAC simples: operador só cria 'Aberto' e não pode atribuir
     const role = user?.role ?? "gestor";
     if (role === "operador") {
-      if (status !== "Aberto") {
-        return res.status(403).json({ error: "Operador sÃ³ pode criar chamados em 'Aberto'." });
+      if (statusNorm !== CHAMADO_STATUS.ABERTO) {
+        return res.status(403).json({ error: "Operador só pode criar chamados em 'Aberto'." });
       }
       if (manutentorEmail) {
-        return res.status(403).json({ error: "Operador nÃ£o pode atribuir manutentor ao criar." });
+        return res.status(403).json({ error: "Operador não pode atribuir manutentor ao criar." });
       }
     }
 
@@ -698,7 +763,7 @@ chamadosRouter.post("/chamados", async (req, res) => {
         [agendamentoId]
       );
       if (!ags.length) {
-        return res.status(400).json({ error: "agendamentoId invÃ¡lido." });
+        return res.status(400).json({ error: "agendamentoId inválido." });
       }
       maquinaIdFromAg = ags[0].maquina_id;
 
@@ -712,7 +777,7 @@ chamadosRouter.post("/chamados", async (req, res) => {
     }
 
     // ------------------------------------------------------------------------------------------
-    // 2) Se vier checklistItems direto no body, tambÃ©m aceitamos
+    // 2) Se vier checklistItems direto no body, também aceitamos
     // ------------------------------------------------------------------------------------------
     let checklistFinal: any[] = [];
     if (Array.isArray(checklistItems) && checklistItems.length) {
@@ -727,35 +792,35 @@ chamadosRouter.post("/chamados", async (req, res) => {
     }
 
     // ------------------------------------------------------------------------------------------
-    // 3) Resolve mÃ¡quina: por agendamento OU por tag/nome
+    // 3) Resolve máquina: por agendamento OU por tag/nome
     // ------------------------------------------------------------------------------------------
-    // Se nÃ£o veio por agendamento, precisa de maquinaTag/maquinaNome
+    // Se não veio por agendamento, precisa de maquinaTag/maquinaNome
     if (!maquinaIdFromAg && !maquinaTag && !maquinaNome) {
       return res.status(400).json({ error: "Informe maquinaTag ou maquinaNome (ou agendamentoId)." });
     }
 
-    // Busca ids de UsuÃ¡rios e mÃ¡quina
+    // Busca ids de Usuários e máquina
     const { rows: uCriador } = await pool.query(
       `SELECT id FROM public.usuarios WHERE LOWER(email) = LOWER($1) LIMIT 1`,
       [criadoPorEmail]
     );
     if (!uCriador.length) {
-      return res.status(400).json({ error: "criadoPorEmail invÃ¡lido." });
+      return res.status(400).json({ error: "criadoPorEmail inválido." });
     }
 
     let manutentorId: string | null = null;
-    if (status === "Em Andamento" && manutentorEmail) {
+    if (statusNorm === CHAMADO_STATUS.EM_ANDAMENTO && manutentorEmail) {
       const { rows: uMant } = await pool.query(
         `SELECT id FROM public.usuarios WHERE LOWER(email) = LOWER($1) LIMIT 1`,
         [manutentorEmail]
       );
       if (!uMant.length) {
-        return res.status(400).json({ error: "manutentorEmail invÃ¡lido." });
+        return res.status(400).json({ error: "manutentorEmail inválido." });
       }
       manutentorId = uMant[0].id;
     }
 
-    // MÃ¡quina via (tag|nome) quando nÃ£o veio de agendamento
+    // Máquina via (tag|nome) quando não veio de agendamento
     let maquinaId: string | null = maquinaIdFromAg;
     if (!maquinaId) {
       const { rows: maq } = await pool.query(
@@ -766,13 +831,13 @@ chamadosRouter.post("/chamados", async (req, res) => {
         [maquinaTag ?? null, maquinaNome ?? null]
       );
       if (!maq.length) {
-        return res.status(400).json({ error: "MÃ¡quina nÃ£o encontrada (tag/nome)." });
+        return res.status(400).json({ error: "Máquina não encontrada (tag/nome)." });
       }
       maquinaId = maq[0].id;
     }
 
     // ------------------------------------------------------------------------------------------
-    // 4) INSERT do chamado (inclui checklist jsonb). responsÃ¡vel inicial = manutentor (se Em Andamento)
+    // 4) INSERT do chamado (inclui checklist jsonb). responsável inicial = manutentor (se Em Andamento)
     // ------------------------------------------------------------------------------------------
     const { rows: created } = await pool.query(
       `INSERT INTO public.chamados
@@ -786,11 +851,11 @@ chamadosRouter.post("/chamados", async (req, res) => {
       [
         maquinaId,
         tipo,                 // 'corretiva' | 'preventiva'
-        status,               // 'Aberto' | 'Em Andamento'
+        statusNorm,           // 'Aberto' | 'Em Andamento' (canônico)
         String(descricao).trim(),
         uCriador[0].id,
         manutentorId,
-        manutentorId,         // se Em Andamento, fica como responsÃ¡vel
+        manutentorId,         // se Em Andamento, fica como responsável
         JSON.stringify(checklistFinal),
       ]
     );
@@ -807,13 +872,20 @@ chamadosRouter.post("/chamados", async (req, res) => {
       );
     }
 
-    // retorna o formato que sua lista jÃ¡ espera
+    // retorna o formato que sua lista já espera
     const { rows } = await pool.query(
       `SELECT
          c.id,
          m.nome  AS maquina,
          c.tipo,
          c.status,
+         CASE
+           WHEN LOWER(c.status) LIKE 'abert%'       THEN 'aberto'
+           WHEN LOWER(c.status) LIKE 'em andament%' THEN 'em_andamento'
+           WHEN LOWER(c.status) LIKE 'conclu%'      THEN 'concluido'
+           WHEN LOWER(c.status) LIKE 'cancel%'      THEN 'cancelado'
+           ELSE 'aberto'
+         END AS status_key,
          c.descricao,
          u.nome  AS criado_por,
          um.nome AS manutentor,
@@ -839,13 +911,13 @@ chamadosRouter.post("/chamados", async (req, res) => {
 /**
  * Body:
  * {
- *   "status": "Aberto" | "Em Andamento" | "ConcluÃ­do",
- *   "manutentorEmail": "manutentor@local"  // obrigatÃ³rio se status = "Em Andamento"
+ *   "status": "Aberto" | "Em Andamento" | "Concluído",
+ *   "manutentorEmail": "manutentor@local"  // obrigatório se status = "Em Andamento"
  * }
  *
  * Regras:
  * - "Em Andamento": manutentor/gestor
- * - "ConcluÃ­do":    manutentor/gestor
+ * - "Concluído":    manutentor/gestor
  * - "Aberto":       gestor
  */
 chamadosRouter.patch("/chamados/:id", async (req, res) => {
@@ -854,41 +926,31 @@ chamadosRouter.patch("/chamados/:id", async (req, res) => {
     const role = user?.role ?? "gestor"; // ambiente dev: default libera
 
     const id = String(req.params.id);
-    const { status, manutentorEmail } = req.body ?? {};
+    const manutentorEmail = req.body?.manutentorEmail as string | undefined;
 
-    if (!["Aberto", "Em Andamento", "ConcluÃ­do"].includes(status)) {
-      return res.status(400).json({ error: "Status invÃ¡lido." });
+    const rawStatus = req.body?.status as string | undefined;
+    const statusNorm = normalizeChamadoStatus(rawStatus);
+    if (!statusNorm) return res.status(400).json({ error: "STATUS_INVALIDO" });
+
+    const isEmAndamento = statusNorm === CHAMADO_STATUS.EM_ANDAMENTO;
+    const isConcluido   = statusNorm === CHAMADO_STATUS.CONCLUIDO;
+    const isAberto      = statusNorm === CHAMADO_STATUS.ABERTO;
+
+    if (isEmAndamento && !(role === "manutentor" || role === "gestor")) {
+      return res.status(403).json({ error: "Apenas manutentor/gestor podem mover para 'Em Andamento'." });
     }
-
-    if (status === "Em Andamento") {
-      if (!(role === "manutentor" || role === "gestor")) {
-        return res
-          .status(403)
-          .json({ error: "Apenas manutentor/gestor podem mover para 'Em Andamento'." });
-      }
-      if (!manutentorEmail) {
-        return res
-          .status(400)
-          .json({ error: "manutentorEmail Ã© obrigatÃ³rio quando status = 'Em Andamento'." });
-      }
+    if (isEmAndamento && !manutentorEmail) {
+      return res.status(400).json({ error: "manutentorEmail é obrigatório quando status = 'Em Andamento'." });
     }
-
-    if (status === "ConcluÃ­do") {
-      if (!(role === "manutentor" || role === "gestor")) {
-        return res.status(403).json({ error: "Apenas manutentor/gestor podem concluir." });
-      }
+    if (isConcluido && !(role === "manutentor" || role === "gestor")) {
+      return res.status(403).json({ error: "Apenas manutentor/gestor podem concluir." });
     }
-
-    if (status === "Aberto") {
-      if (role !== "gestor") {
-        return res.status(403).json({ error: "Apenas gestor pode reabrir para 'Aberto'." });
-      }
+    if (isAberto && role !== "gestor") {
+      return res.status(403).json({ error: "Apenas gestor pode reabrir para 'Aberto'." });
     }
 
     const sql = `
-      WITH mt AS (
-        SELECT id FROM usuarios WHERE email = $2 LIMIT 1
-      )
+      WITH mt AS (SELECT id FROM usuarios WHERE email = $2 LIMIT 1)
       UPDATE chamados c
       SET
         status = $1,
@@ -902,14 +964,29 @@ chamadosRouter.patch("/chamados/:id", async (req, res) => {
           WHEN $1 = 'Aberto' THEN NULL
           ELSE c.responsavel_atual_id
         END,
+        concluido_em = CASE
+          WHEN $1 = 'Concluido' THEN NOW()
+          WHEN $1 = 'Aberto' THEN NULL
+          ELSE c.concluido_em
+        END,
+        concluido_por_id = CASE WHEN $1 = 'Concluido' THEN $3 ELSE c.concluido_por_id END,
+        concluido_por_email = CASE WHEN $1 = 'Concluido' THEN $4 ELSE c.concluido_por_email END,
+        concluido_por_nome  = CASE WHEN $1 = 'Concluido' THEN $5 ELSE c.concluido_por_nome  END,
         atualizado_em = NOW()
-      WHERE c.id = $3
+      WHERE c.id = $6
       RETURNING c.id;
     `;
 
-    const upd = await pool.query(sql, [status, manutentorEmail ?? null, id]);
+    const upd = await pool.query(sql, [
+      statusNorm,
+      manutentorEmail ?? null,
+      (req as any)?.user?.id ?? null,
+      (req as any)?.user?.email ?? null,
+      (req as any)?.user?.name ?? null,
+      id,
+    ]);
     if (upd.rowCount === 0) {
-      return res.status(404).json({ error: "Chamado nÃ£o encontrado ou manutentor inexistente." });
+      return res.status(404).json({ error: "Chamado não encontrado ou manutentor inexistente." });
     }
 
     const { rows } = await pool.query(

@@ -1,3 +1,4 @@
+// utils/status.ts
 export const CHAMADO_STATUS = {
   ABERTO: 'Aberto',
   EM_ANDAMENTO: 'Em Andamento',
@@ -16,28 +17,59 @@ export const AGENDAMENTO_STATUS = {
 
 export type AgendamentoStatus = typeof AGENDAMENTO_STATUS[keyof typeof AGENDAMENTO_STATUS];
 
-function normalize(value?: string | null): string {
+function normalizeBase(value?: string | null): string {
   return String(value ?? '')
     .normalize('NFD')
-    .replace(/\p{Diacritic}/gu, '')
+    .replace(/\p{Diacritic}/gu, '') // remove acentos
+    .replace(/[_-]+/g, ' ')         // trata "em_andamento", "em-andamento"
     .toLowerCase()
-    .trim();
+    .trim()
+    .replace(/\s+/g, ' ');          // colapsa espaços
 }
 
-export function normalizeChamadoStatus(value?: string | null): ChamadoStatus | null {
-  const normalized = normalize(value);
-  if (normalized.startsWith('conclu')) return CHAMADO_STATUS.CONCLUIDO;
-  if (normalized.startsWith('em and')) return CHAMADO_STATUS.EM_ANDAMENTO;
-  if (normalized.startsWith('abert')) return CHAMADO_STATUS.ABERTO;
-  if (normalized.startsWith('canc')) return CHAMADO_STATUS.CANCELADO;
-  return null;
+/**
+ * Normaliza qualquer variação para os 4 canônicos SEM acento.
+ * Nunca retorna null (fallback 'Aberto').
+ */
+export function normalizeChamadoStatus(value?: string | null): ChamadoStatus {
+  const n = normalizeBase(value);
+
+  if (n.startsWith('conclu'))        return CHAMADO_STATUS.CONCLUIDO;      // concluido, concluído, conclu
+  if (n.includes('andament'))        return CHAMADO_STATUS.EM_ANDAMENTO;   // em andamento / andamento
+  if (n.startsWith('cancel'))        return CHAMADO_STATUS.CANCELADO;      // cancelado / cancel
+  if (n.startsWith('abert'))         return CHAMADO_STATUS.ABERTO;         // aberto
+
+  // fallback seguro
+  return CHAMADO_STATUS.ABERTO;
 }
 
-export function normalizeAgendamentoStatus(value?: string | null): AgendamentoStatus | null {
-  const normalized = normalize(value);
-  if (normalized.startsWith('conclu')) return AGENDAMENTO_STATUS.CONCLUIDO;
-  if (normalized.startsWith('inici')) return AGENDAMENTO_STATUS.INICIADO;
-  if (normalized.startsWith('canc')) return AGENDAMENTO_STATUS.CANCELADO;
-  if (normalized.startsWith('agend')) return AGENDAMENTO_STATUS.AGENDADO;
-  return null;
+/**
+ * Normaliza qualquer variação de status de agendamento.
+ * Nunca retorna null (fallback 'agendado').
+ */
+export function normalizeAgendamentoStatus(value?: string | null): AgendamentoStatus {
+  const n = normalizeBase(value);
+
+  if (n.startsWith('conclu'))  return AGENDAMENTO_STATUS.CONCLUIDO;
+  if (n.startsWith('inici'))   return AGENDAMENTO_STATUS.INICIADO;
+  if (n.startsWith('cancel'))  return AGENDAMENTO_STATUS.CANCELADO;
+  if (n.startsWith('agend'))   return AGENDAMENTO_STATUS.AGENDADO;
+
+  // fallback
+  return AGENDAMENTO_STATUS.AGENDADO;
+}
+
+/* -------- Helpers úteis (opcional) -------- */
+
+/** Map chave i18n para badge/classes “aberto|em_andamento|concluido|cancelado”. */
+export const CHAMADO_STATUS_KEY: Record<ChamadoStatus, 'aberto' | 'em_andamento' | 'concluido' | 'cancelado'> = {
+  [CHAMADO_STATUS.ABERTO]: 'aberto',
+  [CHAMADO_STATUS.EM_ANDAMENTO]: 'em_andamento',
+  [CHAMADO_STATUS.CONCLUIDO]: 'concluido',
+  [CHAMADO_STATUS.CANCELADO]: 'cancelado',
+};
+
+/** Retorna a key i18n/badge a partir de qualquer string solta. */
+export function chamadoStatusKey(value?: string | null) {
+  return CHAMADO_STATUS_KEY[normalizeChamadoStatus(value)];
 }

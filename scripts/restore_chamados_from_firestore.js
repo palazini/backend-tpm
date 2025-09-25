@@ -18,9 +18,9 @@ function normStatus(s) {
   const x = norm(s);
   if (x.startsWith('abert')) return 'Aberto';
   if (x.includes('andament')) return 'Em Andamento';
-  if (x.startsWith('conclu')) return 'Concluído';
+  if (x.startsWith('conclu')) return 'Concluido';
   if (x.startsWith('cancel')) return 'Cancelado';
-  if (x.startsWith('fechad') || x.startsWith('encerr')) return 'Concluído';
+  if (x.startsWith('fechad') || x.startsWith('encerr')) return 'Concluido';
   return 'Aberto';
 }
 
