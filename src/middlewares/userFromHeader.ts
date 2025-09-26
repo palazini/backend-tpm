@@ -5,6 +5,8 @@ type Role = "operador" | "manutentor" | "gestor" | "admin";
 
 const VALID_ROLES: Role[] = ["operador", "manutentor", "gestor", "admin"];
 const ROLE_SET = new Set<Role>(VALID_ROLES);
+
+// true (padrão) => exige usuário no DB; false => permite fallback (DEV)
 const AUTH_STRICT = String(process.env.AUTH_STRICT ?? "true").toLowerCase() !== "false";
 
 function normalizeRole(value: string | undefined | null): Role {
@@ -14,19 +16,22 @@ function normalizeRole(value: string | undefined | null): Role {
 
 export async function userFromHeader(req: Request, res: Response, next: NextFunction) {
   try {
-    const hdrEmailRaw = req.header("x-user-email");
-    const hdrRoleRaw = req.header("x-user-role");
+    const email = String(req.header("x-user-email") || "").trim();
 
-    const email = hdrEmailRaw?.trim();
-    const roleFromHeader = normalizeRole(hdrRoleRaw);
+    // se já foi autenticado por JWT e tem req.user, não mexe
+    if ((req as any).user?.id) return next();
 
     if (!email) {
-      req.user = undefined;
+      (req as any).user = undefined;
       return next();
     }
 
+    // 🔎 AGORA buscamos também o role no DB
     const { rows } = await pool.query(
-      `SELECT id, nome FROM public.usuarios WHERE lower(email) = lower($1) LIMIT 1`,
+      `SELECT id, nome, email, role
+         FROM public.usuarios
+        WHERE lower(email) = lower($1)
+        LIMIT 1`,
       [email]
     );
 
@@ -34,22 +39,24 @@ export async function userFromHeader(req: Request, res: Response, next: NextFunc
       if (AUTH_STRICT) {
         return res.status(401).json({ error: "USUARIO_NAO_CADASTRADO" });
       }
-
-      req.user = { id: undefined, email, name: null, role: roleFromHeader };
+      // modo DEV (não-estrito): cria um usuário "temporário" com operador
+      (req as any).user = { id: undefined, email, name: null, role: "operador" };
       return next();
     }
 
     const row = rows[0];
 
-    req.user = {
+    // ✅ SEMPRE usar o role vindo do DB (ignorar x-user-role)
+    (req as any).user = {
       id: row.id,
-      email,
+      email: row.email ?? email,
       name: row.nome ?? null,
-      role: roleFromHeader,
+      role: normalizeRole(row.role),
     };
 
     return next();
   } catch (error) {
+    console.error("userFromHeader", error);
     return next(error);
   }
 }

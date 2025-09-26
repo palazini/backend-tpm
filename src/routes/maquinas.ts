@@ -1,6 +1,7 @@
-﻿import { Router } from 'express';
+﻿import { Router, Request, Response } from 'express';
 import { pool } from '../db';
 import { sseBroadcast } from '../utils/sse';
+import { requireRole } from '../middlewares/requireRole'; // ajuste o caminho se necessário
 
 export const maquinasRouter = Router();
 
@@ -29,7 +30,7 @@ maquinasRouter.get("/maquinas", async (req, res) => {
 
 
 
-// Criar mÃ¡quina
+// Criar máquina
 maquinasRouter.post("/maquinas", async (req, res) => {
   try {
     const { nome, tag, setor, critico } = req.body ?? {};
@@ -37,7 +38,7 @@ maquinasRouter.post("/maquinas", async (req, res) => {
     const tagTrim = String(tag || nomeTrim).trim();
 
     if (!nomeTrim || nomeTrim.length < 2) {
-      return res.status(400).json({ error: "Nome da mÃ¡quina Ã© obrigatÃ³rio." });
+      return res.status(400).json({ error: "Nome da máquina é obrigatório." });
     }
 
     // Evita duplicado (mesmo sem UNIQUE no banco)
@@ -48,7 +49,7 @@ maquinasRouter.post("/maquinas", async (req, res) => {
       [nomeTrim, tagTrim]
     );
     if ((dup.rowCount ?? 0) > 0) {
-      return res.status(409).json({ error: "JÃ¡ existe uma mÃ¡quina com esse nome/tag." });
+      return res.status(409).json({ error: "Já existe uma máquina com esse nome/tag." });
     }
 
     const { rows } = await pool.query(
@@ -64,9 +65,9 @@ maquinasRouter.post("/maquinas", async (req, res) => {
     res.status(201).json(rows[0]);
   } catch (e: any) {
     console.error(e);
-    // Se vocÃª tiver UNIQUE no banco, pode cair aqui:
+    // Se você tiver UNIQUE no banco, pode cair aqui:
     if (e?.code === "23505") {
-      return res.status(409).json({ error: "JÃ¡ existe uma mÃ¡quina com esse nome/tag." });
+      return res.status(409).json({ error: "Já existe uma máquina com esse nome/tag." });
     }
     res.status(500).json({ error: String(e) });
   }
@@ -79,7 +80,7 @@ maquinasRouter.get('/maquinas/:id', async (req, res) => {
     const id = String(req.params.id);
     const TZ = 'America/Sao_Paulo';
 
-    // 1) Dados da mÃ¡quina
+    // 1) Dados da máquina
     const maq = await pool.query(
       `
       SELECT
@@ -95,7 +96,7 @@ maquinasRouter.get('/maquinas/:id', async (req, res) => {
       [id]
     );
     if (!maq.rowCount) {
-      return res.status(404).json({ error: 'MÃ¡quina nÃ£o encontrada.' });
+      return res.status(404).json({ error: 'Máquina não encontrada.' });
     }
 
     // 2) Chamados ATIVOS (Aberto/Em Andamento)
@@ -118,8 +119,8 @@ maquinasRouter.get('/maquinas/:id', async (req, res) => {
       [id]
     );
 
-    // 3) Ãšltimas submissÃµes de checklist (com totais e qtd de "nao")
-    //    Usamos LATERAL para calcular total/nao em uma Ãºnica varredura.
+    // 3) Últimas submissões de checklist (com totais e qtd de "nao")
+    //    Usamos LATERAL para calcular total/nao em uma única varredura.
         const subms = await pool.query(
       `
       SELECT
@@ -146,7 +147,7 @@ maquinasRouter.get('/maquinas/:id', async (req, res) => {
       [id]
     );
 
-    // 4) histÃ³rico agregado por dia/turno (para a tabela "histÃ³rico de Conformidade DiÃ¡ria")
+    // 4) histórico agregado por dia/turno (para a tabela "histórico de Conformidade Diária")
         const historico = await pool.query(
       `
       WITH base AS (
@@ -160,15 +161,15 @@ maquinasRouter.get('/maquinas/:id', async (req, res) => {
       norm AS (
         SELECT
           dt::date AS dia,
-          /* normaliza: aceita 1, 1Âº, 1o, 1Â°, primeiro, turno1; idem para 2 */
+          /* normaliza: aceita 1, 1º, 1o, 1°, primeiro, turno1; idem para 2 */
           CASE
-            WHEN lower(turno_raw) IN ('1','1Âº','1o','1Â°','primeiro','turno1') THEN '1Âº'
-            WHEN lower(turno_raw) IN ('2','2Âº','2o','2Â°','segundo','turno2')   THEN '2Âº'
-            WHEN turno_raw = '' THEN CASE WHEN EXTRACT(HOUR FROM dt) < 14 THEN '1Âº' ELSE '2Âº' END
+            WHEN lower(turno_raw) IN ('1','1º','1o','1°','primeiro','turno1') THEN '1º'
+            WHEN lower(turno_raw) IN ('2','2º','2o','2°','segundo','turno2')   THEN '2º'
+            WHEN turno_raw = '' THEN CASE WHEN EXTRACT(HOUR FROM dt) < 14 THEN '1º' ELSE '2º' END
             ELSE CASE
-              WHEN regexp_replace(lower(turno_raw), '[^0-9]', '', 'g') = '1' THEN '1Âº'
-              WHEN regexp_replace(lower(turno_raw), '[^0-9]', '', 'g') = '2' THEN '2Âº'
-              ELSE CASE WHEN EXTRACT(HOUR FROM dt) < 14 THEN '1Âº' ELSE '2Âº' END
+              WHEN regexp_replace(lower(turno_raw), '[^0-9]', '', 'g') = '1' THEN '1º'
+              WHEN regexp_replace(lower(turno_raw), '[^0-9]', '', 'g') = '2' THEN '2º'
+              ELSE CASE WHEN EXTRACT(HOUR FROM dt) < 14 THEN '1º' ELSE '2º' END
             END
           END AS turno_norm,
           operador_nome
@@ -176,12 +177,12 @@ maquinasRouter.get('/maquinas/:id', async (req, res) => {
       )
       SELECT
         to_char(dia, 'YYYY-MM-DD') AS dia,
-        (COUNT(*) FILTER (WHERE turno_norm = '1Âº') > 0)::bool AS turno1_ok,
-        (COUNT(*) FILTER (WHERE turno_norm = '2Âº') > 0)::bool AS turno2_ok,
+        (COUNT(*) FILTER (WHERE turno_norm = '1º') > 0)::bool AS turno1_ok,
+        (COUNT(*) FILTER (WHERE turno_norm = '2º') > 0)::bool AS turno2_ok,
         COALESCE(string_agg(DISTINCT operador_nome, ', ')
-                 FILTER (WHERE turno_norm = '1Âº'), '') AS turno1_operadores,
+                 FILTER (WHERE turno_norm = '1º'), '') AS turno1_operadores,
         COALESCE(string_agg(DISTINCT operador_nome, ', ')
-                 FILTER (WHERE turno_norm = '2Âº'), '') AS turno2_operadores
+                 FILTER (WHERE turno_norm = '2º'), '') AS turno2_operadores
       FROM norm
       GROUP BY 1
       ORDER BY 1 DESC
@@ -194,7 +195,7 @@ maquinasRouter.get('/maquinas/:id', async (req, res) => {
     res.json({
       ...maq.rows[0],
       chamadosAtivos: ativos.rows,       // cards "Chamados Ativos"
-      checklistHistorico: subms.rows,    // lista das Ãºltimas submissÃµes (com totais)
+      checklistHistorico: subms.rows,    // lista das últimas submissões (com totais)
       historicoChecklist: historico.rows // agregado por dia/turno p/ a tabela do painel
     });
   } catch (e) {
@@ -203,7 +204,7 @@ maquinasRouter.get('/maquinas/:id', async (req, res) => {
   }
 });
 
-// ADICIONAR ITEM AO CHECKLIST DIÃRIO DA MÃQUINA
+// ADICIONAR ITEM AO CHECKLIST DIÁRIO DA MÁQUINA
 
 
 maquinasRouter.post('/maquinas/:id/checklist-add', async (req, res) => {
@@ -211,7 +212,7 @@ maquinasRouter.post('/maquinas/:id/checklist-add', async (req, res) => {
     const id   = String(req.params.id);
     const item = String(req.body?.item || '').trim();
 
-    if (!item) return res.status(400).json({ error: 'Item invÃ¡lido.' });
+    if (!item) return res.status(400).json({ error: 'Item inválido.' });
 
     // evita duplicados (case-insensitive) e adiciona no final
     const { rows } = await pool.query(
@@ -233,7 +234,7 @@ maquinasRouter.post('/maquinas/:id/checklist-add', async (req, res) => {
       [id, item]
     );
 
-    if (!rows.length) return res.status(404).json({ error: 'MÃ¡quina nÃ£o encontrada.' });
+    if (!rows.length) return res.status(404).json({ error: 'Máquina não encontrada.' });
     res.json({ checklistDiario: rows[0].checklist_diario });
   } catch (e:any) {
     console.error(e);
@@ -241,12 +242,12 @@ maquinasRouter.post('/maquinas/:id/checklist-add', async (req, res) => {
   }
 });
 
-// REMOVER ITEM DO CHECKLIST DIÃRIO DA MÃQUINA
+// REMOVER ITEM DO CHECKLIST DIÁRIO DA MÁQUINA
 maquinasRouter.post('/maquinas/:id/checklist-remove', async (req, res) => {
   try {
     const id   = String(req.params.id);
     const item = String(req.body?.item || '').trim();
-    if (!item) return res.status(400).json({ error: 'Item invÃ¡lido.' });
+    if (!item) return res.status(400).json({ error: 'Item inválido.' });
 
     const { rows } = await pool.query(
       `
@@ -262,7 +263,7 @@ maquinasRouter.post('/maquinas/:id/checklist-remove', async (req, res) => {
       [id, item]
     );
 
-    if (!rows.length) return res.status(404).json({ error: 'MÃ¡quina nÃ£o encontrada.' });
+    if (!rows.length) return res.status(404).json({ error: 'Máquina não encontrada.' });
     res.json({ checklistDiario: rows[0].checklist_diario });
   } catch (e:any) {
     console.error(e);
@@ -270,5 +271,20 @@ maquinasRouter.post('/maquinas/:id/checklist-remove', async (req, res) => {
   }
 });
 
-// CRIAR PEÃ‡A (somente gestor)
+// DELETE /maquinas/:id  (somente gestor)
+maquinasRouter.delete('/maquinas/:id', requireRole(['gestor']), async (req: Request, res: Response) => {
+  const { id } = req.params;
 
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id)) {
+    return res.status(400).json({ error: 'id inválido' });
+  }
+
+  try {
+    const r = await pool.query('DELETE FROM public.maquinas WHERE id = $1::uuid', [id]);
+    if (r.rowCount === 0) return res.status(404).json({ error: 'Máquina não encontrada.' });
+    return res.status(204).end();
+  } catch (e) {
+    console.error('DELETE /maquinas/:id', e);
+    return res.status(500).json({ error: 'Erro interno ao excluir máquina.' });
+  }
+});

@@ -120,9 +120,9 @@ async function ensureSchema(client) {
 
   // 4) Deduplicar se houver conflitos
   const dups = await client.query(`
-    SELECT operador_id, maquina_id, data_ref, COUNT(*) AS c
+    SELECT operador_id, maquina_id, data_ref, turno, COUNT(*) AS c
       FROM public.checklist_submissoes
-     GROUP BY 1,2,3
+     GROUP BY 1,2,3,4
     HAVING COUNT(*) > 1
      ORDER BY c DESC;
   `);
@@ -133,7 +133,7 @@ async function ensureSchema(client) {
       WITH marcados AS (
         SELECT id,
                ROW_NUMBER() OVER (
-                 PARTITION BY operador_id, maquina_id, data_ref
+                 PARTITION BY operador_id, maquina_id, data_ref, turno
                  ORDER BY created_at DESC, id DESC
                ) AS rn
         FROM public.checklist_submissoes
@@ -146,8 +146,11 @@ async function ensureSchema(client) {
   }
 
   // 5) Índice único
-  await client.query(`CREATE UNIQUE INDEX IF NOT EXISTS uq_submissao_unica_dia
-                      ON public.checklist_submissoes (operador_id, maquina_id, data_ref);`);
+  await client.query(`
+    DROP INDEX IF EXISTS public.uq_submissao_unica_dia;
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_submissao_unica_dia_turno
+      ON public.checklist_submissoes (operador_id, maquina_id, data_ref, turno);
+  `);
 }
 
 /** ---------------- Main ---------------- */
@@ -166,13 +169,18 @@ async function ensureSchema(client) {
 
   // Mapas auxiliares
   const usersByName = new Map();    // nome_normalizado -> { id, email, nome }
+  const usersByEmail = new Map();   // email -> { id, email, nome }
   const machinesByName = new Map(); // nome_normalizado -> { id, nome }
 
   {
     const { rows } = await client.query(
       `SELECT id, nome, lower(email) as email FROM public.usuarios`
     );
-    for (const r of rows) usersByName.set(normalizeName(r.nome), { id: r.id, email: r.email, nome: r.nome });
+    for (const r of rows) {
+      const user = { id: r.id, email: r.email, nome: r.nome };
+      usersByName.set(normalizeName(r.nome), user);
+      if (r.email) usersByEmail.set(String(r.email).toLowerCase(), user);
+    }
     console.log(`👤 Usuarios carregados: ${rows.length}`);
   }
   {
@@ -210,6 +218,7 @@ async function ensureSchema(client) {
     const d = doc.data() || {};
 
     const operadorNome = (d.operadorNome || '').toString();
+    const operadorEmail = (d.operadorEmail || '').toString().toLowerCase();
     const maquinaNome  = (d.maquinaNome  || '').toString();
     const respostas    = d.respostas || {};
     const turno        = (d.turno || '').toString();
@@ -219,7 +228,9 @@ async function ensureSchema(client) {
     if (!createdAt) { skipTs++; continue; }
     const createdAtISO = createdAt.toISOString();
 
-    const user = usersByName.get(normalizeName(operadorNome));
+    const user =
+      (operadorEmail && usersByEmail.get(operadorEmail)) ||
+      usersByName.get(normalizeName(operadorNome));
     if (!user) {
       skipUser++;
       console.log('↪️ SKIP sem usuário mapeado ->', operadorNome, '(doc:', doc.id, ')');
@@ -255,7 +266,7 @@ async function ensureSchema(client) {
         $8::timestamptz,
         (($8::timestamptz AT TIME ZONE 'America/Sao_Paulo')::date)
         )
-      ON CONFLICT (operador_id, maquina_id, data_ref)
+      ON CONFLICT (operador_id, maquina_id, data_ref, turno)
       DO UPDATE SET
         respostas     = EXCLUDED.respostas,
         turno         = EXCLUDED.turno,

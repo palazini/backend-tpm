@@ -71,14 +71,15 @@ function initFirebase() {
 }
 
 function parseArgs() {
-  const out = { from: null, to: null, lastDays: 2, dryRun: false, verbose: false, by: 'dataAbertura' };
+  const out = { from: null, to: null, lastDays: null, dryRun: false, verbose: false, by: 'dataAbertura', all: false };
   for (const a of process.argv.slice(2)) {
     if (a.startsWith('--from=')) out.from = a.slice(7);
     else if (a.startsWith('--to=')) out.to = a.slice(5);
-    else if (a.startsWith('--last=')) out.lastDays = parseInt(a.slice(7), 10) || 2;
+    else if (a.startsWith('--last=')) out.lastDays = parseInt(a.slice(7), 10) || null;
     else if (a === '--dry-run') out.dryRun = true;
     else if (a === '--verbose') out.verbose = true;
     else if (a.startsWith('--by=')) out.by = a.slice(5); // 'dataAbertura' (default) ou 'updatedAt'
+    else if (a === '--all') out.all = true;
   }
   return out;
 }
@@ -126,35 +127,59 @@ function isTestThing({ maqNome, manutentorNome, operadorNome, operadorEmail }) {
   {
     const { rows } = await pg.query(`SELECT id, nome, lower(email) AS email FROM public.usuarios`);
     rows.forEach((r) => {
-      usersByName.set(norm(r.nome), { id: r.id, email: r.email, nome: r.nome });
-      if (r.email) usersByEmail.set(String(r.email).toLowerCase(), { id: r.id, email: r.email, nome: r.nome });
+      const usr = { id: r.id, email: r.email, nome: r.nome };
+      usersByName.set(norm(r.nome), usr);
+      if (r.email) usersByEmail.set(String(r.email).toLowerCase(), usr);
     });
+    if (!usersByEmail.has('sistema@local')) {
+      const { rows: sysRows } = await pg.query(`
+        INSERT INTO public.usuarios (id, nome, email)
+        VALUES (gen_random_uuid(), 'Sistema', 'sistema@local')
+        ON CONFLICT (email) DO UPDATE SET nome = EXCLUDED.nome
+        RETURNING id, nome, lower(email) AS email;
+      `);
+      if (sysRows.length) {
+        const sys = sysRows[0];
+        const sysUser = { id: sys.id, email: sys.email, nome: sys.nome };
+        usersByName.set(norm(sys.nome), sysUser);
+        usersByEmail.set(String(sys.email).toLowerCase(), sysUser);
+      }
+    }
   }
   {
     const { rows } = await pg.query(`SELECT id, nome FROM public.maquinas`);
     rows.forEach((r) => machinesByName.set(norm(r.nome), { id: r.id, nome: r.nome }));
   }
 
-  // janela
+  // seleção Firestore
   const args = parseArgs();
-  let { from, to } = args;
-  if (!from || !to) {
-    const days = Math.max(1, args.lastDays || 2);
-    const now = new Date();
-    const dFrom = new Date(now);
-    dFrom.setDate(dFrom.getDate() - (days - 1));
-    from = dFrom.toISOString().slice(0, 10);
-    to = now.toISOString().slice(0, 10);
-  }
-  // usar America/Sao_Paulo (-03:00)
-  const start = new Date(`${from}T00:00:00.000-03:00`);
-  const end   = new Date(`${to}T23:59:59.999-03:00`);
-  console.log(`📥 Buscando chamados de ${from} a ${to} ...`);
-
-  // consulta no Firestore
   const col = fsdb.collection('chamados');
-  const field = args.by === 'updatedAt' ? 'updatedAt' : 'dataAbertura';
-  const snap = await col.where(field, '>=', start).where(field, '<=', end).get();
+  let snap;
+  // para o resumo no final:
+  let periodFrom = null, periodTo = null;
+  if (args.all || (!args.from && !args.to && !args.lastDays)) {
+    console.log('📥 Buscando TODOS os chamados (sem filtro de data)...');
+    snap = await col.get();
+    periodFrom = 'ALL';
+    periodTo = 'ALL';
+  } else {
+    let { from, to } = args;
+    if (!from || !to) {
+      const days = Math.max(1, args.lastDays || 2);
+      const now = new Date();
+      const dFrom = new Date(now);
+      dFrom.setDate(dFrom.getDate() - (days - 1));
+      from = dFrom.toISOString().slice(0, 10);
+      to = now.toISOString().slice(0, 10);
+    }
+    const start = new Date(`${from}T00:00:00.000-03:00`);
+    const end   = new Date(`${to}T23:59:59.999-03:00`);
+    console.log(`📥 Buscando chamados de ${from} a ${to} ...`);
+    const field = args.by === 'updatedAt' ? 'updatedAt' : 'dataAbertura';
+    snap = await col.where(field, '>=', start).where(field, '<=', end).get();
+    periodFrom = from;
+    periodTo = to;
+  }
   console.log(`🔥 Chamados encontrados: ${snap.size}`);
 
   let upserts = 0, skips = 0, obsUpserts = 0, errors = 0;
@@ -177,7 +202,7 @@ function isTestThing({ maqNome, manutentorNome, operadorNome, operadorEmail }) {
 
   const updObsSQL = `
     UPDATE public.chamado_observacoes SET
-      autor_id    = $2,
+      autor_id    = $2::uuid,
       autor_nome  = $3::text,
       autor_email = $4::text,
       ${msgSetFragment},
@@ -190,7 +215,7 @@ function isTestThing({ maqNome, manutentorNome, operadorNome, operadorEmail }) {
     INSERT INTO public.chamado_observacoes
       (chamado_id, fs_id, autor_id, autor_nome, autor_email, ${msgColsInsert}, criado_em)
     VALUES
-      ($1, $2::text, $3, $4::text, $5::text, ${msgValsInsert}, $7::timestamptz)
+      ($1, $2::text, $3::uuid, $4::text, $5::text, ${msgValsInsert}, $7::timestamptz)
     RETURNING id;
   `;
 
@@ -220,6 +245,18 @@ function isTestThing({ maqNome, manutentorNome, operadorNome, operadorEmail }) {
       const tAbert = d.dataAbertura && typeof d.dataAbertura.toDate === 'function' ? d.dataAbertura.toDate() : null;
       const tConc  = d.dataConclusao && typeof d.dataConclusao.toDate === 'function' ? d.dataConclusao.toDate() : null;
       const tUpd   = d.updatedAt && typeof d.updatedAt.toDate === 'function' ? d.updatedAt.toDate() : tConc || tAbert || new Date();
+      let tAtend   = d.atendidoEm && typeof d.atendidoEm.toDate === 'function' ? d.atendidoEm.toDate() : null;
+      if (!tAtend && Array.isArray(d.observacoes)) {
+        for (const o of d.observacoes) {
+          const autor = String(o.autor || '').toLowerCase();
+          const dt = o.data && typeof o.data.toDate === 'function' ? o.data.toDate() : null;
+          const txt = String(o.texto || '').toLowerCase();
+          if (autor === 'sistema' && /chamado atendido/.test(txt) && dt) {
+            tAtend = dt;
+            break;
+          }
+        }
+      }
 
       // campos principais
       const tipo   = String(d.tipo || '').toLowerCase();
@@ -242,10 +279,6 @@ function isTestThing({ maqNome, manutentorNome, operadorNome, operadorEmail }) {
       const criUser =
         usersByEmail.get(operadorEmail) ||
         usersByName.get(norm(operadorNome));
-      const criado_por_id    = criUser?.id || null;
-      const criado_por_nome  = operadorNome || criUser?.nome || null;
-      const criado_por_email = operadorEmail || criUser?.email || null;
-
       // "Atribuído para" via observação "Sistema"
       let atrib_nome = null, atrib_email = null, atrib_id = null;
       if (Array.isArray(d.observacoes)) {
@@ -260,6 +293,20 @@ function isTestThing({ maqNome, manutentorNome, operadorNome, operadorEmail }) {
             }
           }
         }
+      }
+
+      const systemUser =
+        usersByEmail.get('sistema@local') ||
+        usersByName.get(norm('Sistema')) ||
+        null;
+      const criado_por_id    = criUser?.id || atendido_por_id || atrib_id || systemUser?.id;
+      const criado_por_nome  = operadorNome || criUser?.nome || atendido_por_nome || atrib_nome || systemUser?.nome || 'Sistema';
+      const criado_por_email = operadorEmail || criUser?.email || atendido_por_email || atrib_email || systemUser?.email || 'sistema@local';
+
+      if (!criado_por_id) {
+        if (args.verbose) console.warn('  ⚠️  Sem criado_por_id resolvido; pulando doc', doc.id);
+        skips++;
+        continue;
       }
 
       // params comuns (update/insert de chamados)
@@ -284,8 +331,9 @@ function isTestThing({ maqNome, manutentorNome, operadorNome, operadorEmail }) {
         tAbert ? tAbert.toISOString() : null, // $18  criado_em
         tUpd   ? tUpd.toISOString()   : null, // $19  atualizado_em
         tConc  ? tConc.toISOString()  : null, // $20  concluido_em
-        item,                  // $21
-        chkKey,                // $22
+        tAtend ? tAtend.toISOString() : null, // $21  atendido_em
+        item,                  // $22
+        chkKey,                // $23
       ];
 
       if (args.dryRun || args.verbose) {
@@ -295,6 +343,7 @@ function isTestThing({ maqNome, manutentorNome, operadorNome, operadorEmail }) {
           status, tipo,
           criado_em: tAbert?.toISOString(),
           concluido_em: tConc?.toISOString(),
+          atendido_em: tAtend?.toISOString(),
           problema_reportado: problema,
           causa, servico_realizado: servico,
           atendido_por: { nome: atendido_por_nome, email: atendido_por_email },
@@ -312,28 +361,29 @@ function isTestThing({ maqNome, manutentorNome, operadorNome, operadorEmail }) {
         // UPDATE-then-INSERT (casts explícitos)
         const updSQL = `
           UPDATE public.chamados SET
-            maquina_id            = $2,
+            maquina_id            = $2::uuid,
             tipo                  = $3::text,
             status                = $4::text,
             descricao             = $5::text,
             problema_reportado    = $6::text,
             causa                 = $7::text,
             servico_realizado     = $8::text,
-            criado_por_id         = $9,
+            criado_por_id         = $9::uuid,
             criado_por_nome       = $10::text,
             criado_por_email      = $11::text,
-            atendido_por_id       = $12,
+            atendido_por_id       = $12::uuid,
             atendido_por_nome     = $13::text,
             atendido_por_email    = $14::text,
-            atribuido_para_id     = $15,
+            atribuido_para_id     = $15::uuid,
             atribuido_para_nome   = $16::text,
             atribuido_para_email  = $17::text,
-            responsavel_atual_id  = COALESCE($15, responsavel_atual_id),
+            responsavel_atual_id  = COALESCE($15::uuid, $12::uuid, responsavel_atual_id),
             criado_em             = COALESCE(LEAST(chamados.criado_em, $18::timestamptz), $18::timestamptz),
             atualizado_em         = GREATEST(COALESCE(chamados.atualizado_em, $19::timestamptz), $19::timestamptz),
             concluido_em          = COALESCE($20::timestamptz, chamados.concluido_em),
-            item                  = $21::text,
-            checklist_item_key    = $22::text
+            atendido_em           = COALESCE($21::timestamptz, chamados.atendido_em),
+            item                  = $22::text,
+            checklist_item_key    = $23::text
           WHERE fs_id = $1::text
           RETURNING id;
         `;
@@ -349,17 +399,17 @@ function isTestThing({ maqNome, manutentorNome, operadorNome, operadorEmail }) {
                atendido_por_id, atendido_por_nome, atendido_por_email,
                atribuido_para_id, atribuido_para_nome, atribuido_para_email,
                responsavel_atual_id,
-               criado_em, atualizado_em, concluido_em,
+               criado_em, atualizado_em, concluido_em, atendido_em,
                item, checklist_item_key)
             VALUES
-              ($1::text, $2, $3::text, $4::text, $5::text, $6::text,
+              ($1::text, $2::uuid, $3::text, $4::text, $5::text, $6::text,
                $7::text, $8::text,
-               $9, $10::text, $11::text,
-               $12, $13::text, $14::text,
-               $15, $16::text, $17::text,
-               $15,  -- responsável inicial = atribuído (quando houver)
-               $18::timestamptz, $19::timestamptz, $20::timestamptz,
-               $21::text, $22::text)
+               $9::uuid, $10::text, $11::text,
+               $12::uuid, $13::text, $14::text,
+               $15::uuid, $16::text, $17::text,
+               COALESCE($15::uuid, $12::uuid),  -- responsavel inicial = atribuido (quando houver; senao atendente)
+               $18::timestamptz, $19::timestamptz, $20::timestamptz, $21::timestamptz,
+               $22::text, $23::text)
             RETURNING id;
           `;
           r = await pg.query(insSQL, params);
@@ -397,13 +447,14 @@ function isTestThing({ maqNome, manutentorNome, operadorNome, operadorEmail }) {
             continue;
           }
 
-          if (args.dryRun || args.verbose) {
-            console.log('  [DRY-RUN] obs', {
+          if (args.verbose) {
+            console.log('  [obs]', {
               at: criado_em.toISOString(),
               autor: autor_nome,
               msg: texto.slice(0, 200)
             });
-          } else {
+          }
+          if (!args.dryRun) {
             // UPDATE-then-INSERT da observação (parametrizado!)
             const upd = await pg.query(updObsSQL, [
               obs_fs_id,               // $1
@@ -438,7 +489,7 @@ function isTestThing({ maqNome, manutentorNome, operadorNome, operadorEmail }) {
 
   console.log('------------------------------------');
   console.log('✅ FIM');
-  console.log({ from, to, scanned: snap.size, upserts, obsUpserts, skips, errors });
+  console.log({ from: periodFrom, to: periodTo, scanned: snap.size, upserts, obsUpserts, skips, errors });
 
   await pg.end();
   process.exit(0);
