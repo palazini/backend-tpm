@@ -1,6 +1,0 @@
-//Checklists//
-//------------------------------------------------------------------------------------------------------------
-$from = (Get-Date).AddDays(-1).ToString('yyyy-MM-dd')
-$to   = (Get-Date).ToString('yyyy-MM-dd')
-node scripts/restore_from_firestore.js --dry-run --from=$from --to=$to
-node scripts/restore_from_firestore.js --from=$from --to=$to

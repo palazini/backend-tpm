@@ -1,0 +1,20 @@
+@'
+node_modules
+dist
+.git
+.gitignore
+Dockerfile*
+docker-compose*
+*.log
+.env
+scripts/
+tmp/
+coverage
+.env.*
+service-account.json
+full.sql
+.vscode
+.idea
+.DS_Store
+Thumbs.db
+'@ | Set-Content -Encoding UTF8 -NoNewline .dockerignore

@@ -19,7 +19,13 @@ dotenv.config();
 
 const app = express();
 
-app.use(cors());
+const raw = process.env.CORS_ORIGINS ?? '';
+const ALLOW = raw.split(',').map(s => s.trim()).filter(Boolean);
+
+app.use(cors({
+  origin: ALLOW.length ? ALLOW : true, // se não definir CORS_ORIGINS, libera tudo (útil p/ dev)
+}));
+
 app.use(express.json());
 app.use(userFromHeader);
 

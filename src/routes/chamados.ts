@@ -2,7 +2,7 @@
 import { requireRole } from '../middlewares/requireRole';
 import { pool, withTx } from '../db';
 import { slugifyItem } from '../utils/slug';
-import { CHAMADO_STATUS, normalizeChamadoStatus } from '../utils/status';
+import { CHAMADO_STATUS, normalizeChamadoStatus, isStatusAtivo } from '../utils/status';
 import { sseBroadcast } from '../utils/sse';
 
 export const chamadosRouter = Router();
@@ -723,7 +723,7 @@ chamadosRouter.post("/chamados", async (req, res) => {
     } = req.body ?? {};
 
     const statusNorm = normalizeChamadoStatus(status) ?? CHAMADO_STATUS.ABERTO;
-    if (![CHAMADO_STATUS.ABERTO, CHAMADO_STATUS.EM_ANDAMENTO].includes(statusNorm)) {
+    if (!isStatusAtivo(statusNorm)) {
       return res.status(400).json({ error: "Status invalido para criacao." });
     }
 

@@ -73,3 +73,15 @@ export const CHAMADO_STATUS_KEY: Record<ChamadoStatus, 'aberto' | 'em_andamento'
 export function chamadoStatusKey(value?: string | null) {
   return CHAMADO_STATUS_KEY[normalizeChamadoStatus(value)];
 }
+
+// Quais contam como "ativos" (para criação/listagens padrão)
+export const CHAMADOS_ATIVOS: ChamadoStatus[] = [
+  CHAMADO_STATUS.ABERTO,
+  CHAMADO_STATUS.EM_ANDAMENTO,
+];
+
+// Helper de checagem (aceita string solta ou ChamadoStatus)
+export function isStatusAtivo(value?: string | ChamadoStatus | null): boolean {
+  const s = normalizeChamadoStatus(typeof value === 'string' ? value : (value ?? ''));
+  return s === CHAMADO_STATUS.ABERTO || s === CHAMADO_STATUS.EM_ANDAMENTO;
+}

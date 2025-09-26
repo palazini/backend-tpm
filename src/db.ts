@@ -1,4 +1,5 @@
-﻿import { Pool, PoolClient } from "pg";
+﻿// src/db.ts
+import { Pool, PoolClient } from "pg";
 import dotenv from "dotenv";
 
 dotenv.config();
@@ -16,9 +17,14 @@ function resolveConnectionString(): string {
 }
 
 const connectionString = resolveConnectionString();
-const needsSsl =
-  process.env.PGSSL === "require" ||
+
+// <- NOVO: considera PGSSLMODE, PGSSL, sslmode=require na URL e provedores comuns
+const pgSslEnv = String(process.env.PGSSLMODE || process.env.PGSSL || "").toLowerCase();
+const urlForcesSSL =
+  /(^|[?&])sslmode=require/i.test(connectionString) ||
   /neon|supabase|render|heroku/i.test(connectionString);
+
+const needsSsl = pgSslEnv === "require" || urlForcesSSL;
 
 export const pool = new Pool({
   connectionString,
