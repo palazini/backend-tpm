@@ -1,7 +1,8 @@
-﻿import { Router, Request, Response } from 'express';
+import { Router, Request, Response } from 'express';
 import { pool } from '../db';
 import { sseBroadcast } from '../utils/sse';
 import { requireRole } from '../middlewares/requireRole'; // ajuste o caminho se necessário
+import { userFromHeader } from '../middlewares/userFromHeader';
 
 export const maquinasRouter = Router();
 
@@ -204,9 +205,72 @@ maquinasRouter.get('/maquinas/:id', async (req, res) => {
   }
 });
 
+maquinasRouter.patch(
+  '/maquinas/:id/nome',
+  requireRole(['gestor', 'admin']),
+  async (req, res) => {
+    const id = String(req.params.id || '').trim();
+    const novoNome = String(req.body?.nome ?? '').trim();
+    const syncTag  = Boolean(req.body?.syncTag ?? true);
+
+    if (!id)       return res.status(400).json({ error: 'ID_OBRIGATORIO' });
+    if (!novoNome) return res.status(400).json({ error: 'NOME_OBRIGATORIO' });
+
+    try {
+      // 0) Existe?
+      const cur = await pool.query(
+        `SELECT id, nome, tag FROM public.maquinas WHERE id = $1::uuid`,
+        [id]
+      );
+      if (!cur.rowCount) return res.status(404).json({ error: 'MAQUINA_NAO_ENCONTRADA' });
+
+      // 1) Duplicidade (nome sempre; tag só se syncTag = true)
+      const alvoTag = syncTag ? novoNome : null;
+      const dup = await pool.query(
+        `
+        SELECT 1
+          FROM public.maquinas
+         WHERE id <> $3::uuid
+           AND (
+                lower(nome) = lower($1::text)
+             OR ($2::text IS NOT NULL AND lower(tag) = lower($2::text))
+           )
+         LIMIT 1
+        `,
+        [novoNome, alvoTag, id]
+      );
+      if (dup.rowCount) return res.status(409).json({ error: 'MAQUINA_DUPLICADA' });
+
+      // 2) UPDATE com casts explícitos
+      const upd = await pool.query(
+        `
+        UPDATE public.maquinas
+           SET nome = $2::text,
+               tag  = CASE WHEN $3::boolean THEN $2::text ELSE tag END,
+               atualizado_em = now()
+         WHERE id = $1::uuid
+         RETURNING id, nome, tag, setor, critico
+        `,
+        [id, novoNome, syncTag]
+      );
+
+      try { sseBroadcast({ topic: 'maquinas', action: 'updated', id }); } catch {}
+      return res.json(upd.rows[0]);
+    } catch (e: any) {
+      console.error('PATCH /maquinas/:id/nome error:', {
+        message: e?.message,
+        code: e?.code,
+        detail: e?.detail
+      });
+      if (e?.code === '23505') return res.status(409).json({ error: 'MAQUINA_DUPLICADA' });
+      if (e?.code === '22P02') return res.status(400).json({ error: 'ID_INVALIDO' });
+      if (e?.code === '42703') return res.status(500).json({ error: 'COLUNA_INEXISTENTE', detail: e?.detail });
+      return res.status(500).json({ error: 'ERRO_RENOMEAR_MAQUINA' });
+    }
+  }
+);
+
 // ADICIONAR ITEM AO CHECKLIST DIÁRIO DA MÁQUINA
-
-
 maquinasRouter.post('/maquinas/:id/checklist-add', async (req, res) => {
   try {
     const id   = String(req.params.id);
@@ -288,3 +352,4 @@ maquinasRouter.delete('/maquinas/:id', requireRole(['gestor']), async (req: Requ
     return res.status(500).json({ error: 'Erro interno ao excluir máquina.' });
   }
 });
+
