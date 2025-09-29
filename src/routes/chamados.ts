@@ -1,9 +1,17 @@
-﻿import { Router } from 'express';
+import { Router } from 'express';
 import { requireRole } from '../middlewares/requireRole';
 import { pool, withTx } from '../db';
-import { slugifyItem } from '../utils/slug';
 import { CHAMADO_STATUS, normalizeChamadoStatus, isStatusAtivo } from '../utils/status';
 import { sseBroadcast } from '../utils/sse';
+import { z } from "zod";
+import {
+  CreateChamadoSchema,
+  ConcluirChamadoSchema,
+  PatchChecklistSchema,
+  ObservacaoSchema,
+  ChecklistItemSchema,
+} from "@manutencao/shared";
+
 
 export const chamadosRouter = Router();
 
@@ -248,18 +256,26 @@ chamadosRouter.get("/chamados/:id", async (req, res) => {
 // ---------- Chamados: observacoes ----------
 chamadosRouter.post(
   "/chamados/:id/observacoes",
-  requireRole(['operador', 'manutentor', 'gestor']),
+  requireRole(["operador", "manutentor", "gestor"]),
   async (req, res) => {
     try {
       const chamadoId = String(req.params.id);
-      const texto = String(req.body?.texto ?? '').trim();
-      if (!texto) {
-        return res.status(400).json({ error: 'TEXTO_OBRIGATORIO' });
+
+      // ✅ validação + trim
+      const parsed = ObservacaoSchema.safeParse(req.body ?? {});
+      if (!parsed.success) {
+        return res.status(400).json({
+          error: "VALIDATION_ERROR",
+          issues: parsed.error.issues.map(i => ({ path: i.path.join("."), message: i.message })),
+        });
       }
+      const { texto } = parsed.data;
 
       const user = req.user;
-      const autorId = user?.id ?? null;
-      const autorNome = user?.name ? String(user.name).trim() : user?.email ? String(user.email).trim() : null;
+      const autorId   = user?.id ?? null;
+      const autorNome = user?.name ? String(user.name).trim()
+                        : user?.email ? String(user.email).trim()
+                        : null;
 
       const { rows } = await pool.query(
         `INSERT INTO public.chamado_observacoes
@@ -273,9 +289,9 @@ chamadosRouter.post(
 
       const { rows: lista } = await pool.query(
         `SELECT
-           COALESCE(o.texto, o.mensagem, '')        AS texto,
+           COALESCE(o.texto, o.mensagem, '')          AS texto,
            to_char(o.criado_em, 'YYYY-MM-DD HH24:MI') AS criado_em,
-           COALESCE(o.autor_nome, u.nome, 'Sistema') AS autor
+           COALESCE(o.autor_nome, u.nome, 'Sistema')  AS autor
          FROM public.chamado_observacoes o
          LEFT JOIN public.usuarios u ON u.id = o.autor_id
         WHERE o.chamado_id = $1
@@ -287,17 +303,17 @@ chamadosRouter.post(
 
       try {
         sseBroadcast?.({
-          topic: 'chamados',
-          action: 'observacao-criada',
+          topic: "chamados",
+          action: "observacao-criada",
           id: chamadoId,
           payload: ultimaObservacao,
         });
       } catch {}
 
       return res.status(201).json({ ok: true, observacao: ultimaObservacao, observacoes: lista });
-    } catch (error) {
-      if ((error as any)?.code === '23503') {
-        return res.status(404).json({ error: 'CHAMADO_NAO_ENCONTRADO' });
+    } catch (error: any) {
+      if (error?.code === "23503") {
+        return res.status(404).json({ error: "CHAMADO_NAO_ENCONTRADO" });
       }
       console.error(error);
       return res.status(500).json({ error: String(error) });
@@ -308,24 +324,23 @@ chamadosRouter.post(
 // ---------- Chamados: atender ----------
 chamadosRouter.post(
   "/chamados/:id/atender",
-  requireRole(['manutentor', 'gestor']),
+  requireRole(["manutentor"]),
   async (req, res) => {
     try {
       const user = req.user;
       if (!user?.id) {
-        return res.status(401).json({ error: 'USUARIO_NAO_CADASTRADO' });
+        return res.status(401).json({ error: "USUARIO_NAO_CADASTRADO" });
       }
 
       const chamadoId = String(req.params.id);
+      const atendenteId    = user.id;
+      const atendenteEmail = user.email ? String(user.email).trim() : null;
+      const atendenteNome  = user.name  ? String(user.name).trim()  : null;
 
       const resultado = await withTx(async (client) => {
+        // trava a linha para transição segura
         const { rows } = await client.query(
-          `SELECT status,
-                  tipo,
-                  manutentor_id,
-                  responsavel_atual_id,
-                  atendido_por_id,
-                  agendamento_id
+          `SELECT status, tipo, manutentor_id, responsavel_atual_id, atendido_por_id, agendamento_id
              FROM public.chamados
             WHERE id = $1
             FOR UPDATE`,
@@ -338,47 +353,51 @@ chamadosRouter.post(
 
         const atual = rows[0];
         const statusAtual = normalizeChamadoStatus(atual.status);
+
+        // só permite atender a partir de "Aberto"
         if (statusAtual !== CHAMADO_STATUS.ABERTO) {
-          return { conflict: atual.status as string };
+          return { conflict: String(atual.status) };
         }
 
-        const atendenteEmail = user.email ? String(user.email).trim() : null;
-        const atendenteNome = user.name ? String(user.name).trim() : null;
-
+        // Atualiza para "Em Andamento"
         const { rows: updated } = await client.query(
           `UPDATE public.chamados
-              SET status = $2,
-                  manutentor_id = COALESCE(manutentor_id, $3),
-                  responsavel_atual_id = $3,
-                  atendido_por_id = $3,
-                  atendido_por_email = $4,
-                  atendido_por_nome = $5,
-                  atendido_em = NOW(),
-                  atualizado_em = NOW()
+              SET status               = $2,
+                  -- não sobrescreve se já existir
+                  manutentor_id        = COALESCE(manutentor_id, $3),
+                  responsavel_atual_id = COALESCE(responsavel_atual_id, $3),
+
+                  -- marca quem atendeu e quando (idempotente)
+                  atendido_por_id      = COALESCE(atendido_por_id,    $3),
+                  atendido_por_email   = COALESCE(atendido_por_email, $4),
+                  atendido_por_nome    = COALESCE(atendido_por_nome,  $5),
+                  atendido_em          = COALESCE(atendido_em,        NOW()),
+
+                  atualizado_em        = NOW()
             WHERE id = $1
-          RETURNING id, status, manutentor_id, responsavel_atual_id, atendido_por_id, agendamento_id`,
-          [chamadoId, CHAMADO_STATUS.EM_ANDAMENTO, user.id, atendenteEmail, atendenteNome]
+        RETURNING id, status, manutentor_id, responsavel_atual_id, atendido_por_id, atendido_em, agendamento_id`,
+          [chamadoId, CHAMADO_STATUS.EM_ANDAMENTO, atendenteId, atendenteEmail, atendenteNome]
         );
 
         if (!updated.length) {
-          return { conflict: atual.status as string };
+          return { conflict: String(atual.status) };
         }
 
         return { row: updated[0] };
       });
 
       if (resultado.notFound) {
-        return res.status(404).json({ error: 'CHAMADO_NAO_ENCONTRADO' });
+        return res.status(404).json({ error: "CHAMADO_NAO_ENCONTRADO" });
       }
-
       if (resultado.conflict) {
-        return res.status(409).json({ error: 'STATE_CONFLICT', status: resultado.conflict });
+        return res.status(409).json({ error: "STATE_CONFLICT", status: resultado.conflict });
       }
 
       try {
-        sseBroadcast?.({ topic: 'chamados', action: 'updated', id: chamadoId });
+        sseBroadcast?.({ topic: "chamados", action: "updated", id: chamadoId });
       } catch {}
 
+      // mantém o mesmo shape de retorno que você já usa
       return res.json({ ok: true, chamado: resultado.row });
     } catch (error) {
       console.error(error);
@@ -390,17 +409,27 @@ chamadosRouter.post(
 // ---------- Chamados: concluir ----------
 chamadosRouter.post(
   "/chamados/:id/concluir",
-  requireRole(['manutentor', 'gestor']),
+  requireRole(['manutentor']),
   async (req, res) => {
     try {
       const user = req.user;
       if (!user?.id) {
-        return res.status(401).json({ error: 'USUARIO_NAO_CADASTRADO' });
+        return res.status(401).json({ error: "USUARIO_NAO_CADASTRADO" });
       }
 
       const chamadoId = String(req.params.id);
-      const body = req.body ?? {};
 
+      // ✅ validação básica do body e normalização do checklist (se vier)
+      const parsed = ConcluirChamadoSchema.safeParse(req.body ?? {});
+      if (!parsed.success) {
+        return res.status(400).json({
+          error: "VALIDATION_ERROR",
+          issues: parsed.error.issues.map((i) => ({ path: i.path.join("."), message: i.message })),
+        });
+      }
+      const body = parsed.data;
+
+      // lê status/tipo e vínculos para regras de permissão/transição
       const { rows } = await pool.query(
         `SELECT status,
                 tipo,
@@ -415,146 +444,100 @@ chamadosRouter.post(
       );
 
       if (!rows.length) {
-        return res.status(404).json({ error: 'CHAMADO_NAO_ENCONTRADO' });
+        return res.status(404).json({ error: "CHAMADO_NAO_ENCONTRADO" });
       }
 
       const atual = rows[0];
       const statusAtual = normalizeChamadoStatus(atual.status);
       if (statusAtual !== CHAMADO_STATUS.EM_ANDAMENTO) {
-        return res.status(409).json({ error: 'STATE_CONFLICT', status: atual.status });
+        return res.status(409).json({ error: "STATE_CONFLICT", status: atual.status });
       }
 
-      // Permissão: quem pode concluir (atendente/resp/manutentor) ou gestor
+      // Permissão: manutentor/resp/atendente podem concluir; gestor sempre pode
       const associados = [atual.manutentor_id, atual.responsavel_atual_id, atual.atendido_por_id]
         .filter(Boolean)
         .map((v) => String(v));
-      if (user.role !== 'gestor' && !associados.includes(String(user.id))) {
-        return res.status(403).json({ error: 'PERMISSAO_NEGADA' });
+      if (user.role !== "gestor" && !associados.includes(String(user.id))) {
+        return res.status(403).json({ error: "PERMISSAO_NEGADA" });
       }
 
-      const tipoChamado = typeof atual.tipo === 'string' ? atual.tipo.toLowerCase() : '';
+      const tipoChamado = typeof atual.tipo === "string" ? atual.tipo.toLowerCase() : "";
 
-      // Normalização de checklist (se vier no body)
+      // ✅ Regras por tipo
+      // - preventiva: checklist é obrigatório e com pelo menos 1 item já normalizado
+      // - corretiva: causa e solucao obrigatórias; checklist opcional
       let checklistJson: string | null = null;
-      if (tipoChamado === 'preventiva') {
-        if (!Array.isArray(body.checklist)) {
-          return res.status(400).json({ error: 'CHECKLIST_OBRIGATORIO' });
+
+      if (tipoChamado === "preventiva") {
+        if (!Array.isArray(body.checklist) || body.checklist.length === 0) {
+          return res.status(400).json({ error: "CHECKLIST_OBRIGATORIO" });
         }
-        const normalizedChecklist = body.checklist
-          .map((item: any) => {
-            const texto = String(item?.item ?? item ?? '').trim();
-            if (!texto) return null;
-            const respostaRaw = String(item?.resposta ?? item?.status ?? 'sim').toLowerCase();
-            const resposta = respostaRaw.startsWith('n') ? 'nao' : 'sim';
-            return { item: texto, resposta };
-          })
-          .filter(Boolean);
-        if (!normalizedChecklist.length) {
-          return res.status(400).json({ error: 'CHECKLIST_OBRIGATORIO' });
+        checklistJson = JSON.stringify(body.checklist);
+      } else if (tipoChamado === "corretiva") {
+        const causaOk = typeof body.causa === "string" && body.causa.trim().length > 0;
+        const solucaoOk = typeof body.solucao === "string" && body.solucao.trim().length > 0;
+        if (!causaOk) return res.status(400).json({ error: "CAUSA_OBRIGATORIA" });
+        if (!solucaoOk) return res.status(400).json({ error: "SOLUCAO_OBRIGATORIA" });
+
+        if (Array.isArray(body.checklist) && body.checklist.length) {
+          checklistJson = JSON.stringify(body.checklist);
         }
-        checklistJson = JSON.stringify(normalizedChecklist);
-      } else if (Array.isArray(body.checklist)) {
-        // se passar checklist em corretiva, não é erro - apenas armazenamos
-        const normalizedChecklist = body.checklist
-          .map((item: any) => {
-            const texto = String(item?.item ?? item ?? '').trim();
-            if (!texto) return null;
-            const respostaRaw = String(item?.resposta ?? item?.status ?? 'sim').toLowerCase();
-            const resposta = respostaRaw.startsWith('n') ? 'nao' : 'sim';
-            return { item: texto, resposta };
-          })
-          .filter(Boolean);
-        checklistJson = normalizedChecklist.length ? JSON.stringify(normalizedChecklist) : null;
+      } else {
+        // se futuramente houver outros tipos, no mínimo aceite checklist se vier
+        if (Array.isArray(body.checklist) && body.checklist.length) {
+          checklistJson = JSON.stringify(body.checklist);
+        }
       }
 
-      // Causa/Solução
-      let causaFinal: string | null = null;
-      let solucaoFinal: string | null = null;
-      if (tipoChamado === 'corretiva') {
-        if (typeof body.causa !== 'string' || !body.causa.trim()) {
-          return res.status(400).json({ error: 'CAUSA_OBRIGATORIA' });
-        }
-        if (typeof body.solucao !== 'string' || !body.solucao.trim()) {
-          return res.status(400).json({ error: 'SOLUCAO_OBRIGATORIA' });
-        }
-        causaFinal = body.causa.trim();
-        solucaoFinal = body.solucao.trim();
-      } else {
-        causaFinal   = typeof body.causa   === 'string' ? body.causa.trim()   || null : null;
-        solucaoFinal = typeof body.solucao === 'string' ? body.solucao.trim() || null : null;
-      }
+      const causaFinal =
+        tipoChamado === "corretiva"
+          ? (body.causa ?? "").trim()
+          : (typeof body.causa === "string" ? body.causa.trim() : null) || null;
+
+      const solucaoFinal =
+        tipoChamado === "corretiva"
+          ? (body.solucao ?? "").trim()
+          : (typeof body.solucao === "string" ? body.solucao.trim() : null) || null;
 
       const chamadoAtualizado = await withTx(async (client) => {
         const paramsBase = {
-          concluidorId:    user.id,
+          concluidorId: user.id,
           concluidorEmail: user.email ?? null,
-          concluidorNome:  user.name  ?? null,
+          concluidorNome: user.name ?? null,
         };
 
-        let qEnd;
-        if (tipoChamado === 'corretiva') {
-          qEnd = await client.query(
-            `
-            UPDATE public.chamados
-               SET status               = $2,
-                   concluido_em         = NOW(),
-                   checklist            = COALESCE($3::jsonb, checklist),
-                   causa                = COALESCE($4::text, causa),
-                   solucao              = COALESCE($5::text, solucao),
-                   servico_realizado    = COALESCE($5::text, servico_realizado),
-                   concluido_por_id     = $6,
-                   concluido_por_email  = $7,
-                   concluido_por_nome   = $8,
-                   atualizado_em        = NOW()
-             WHERE id = $1
-             RETURNING id, status, tipo, agendamento_id
-            `,
-            [
-              chamadoId,
-              CHAMADO_STATUS.CONCLUIDO,
-              checklistJson,
-              causaFinal,
-              solucaoFinal,
-              paramsBase.concluidorId,
-              paramsBase.concluidorEmail,
-              paramsBase.concluidorNome,
-            ]
-          );
-        } else {
-          // preventiva
-          qEnd = await client.query(
-            `
-            UPDATE public.chamados
-               SET status               = $2,
-                   concluido_em         = NOW(),
-                   checklist            = COALESCE($3::jsonb, checklist),
-                   causa                = COALESCE($4::text, causa),
-                   solucao              = COALESCE($5::text, solucao),
-                   concluido_por_id     = $6,
-                   concluido_por_email  = $7,
-                   concluido_por_nome   = $8,
-                   atualizado_em        = NOW()
-             WHERE id = $1
-             RETURNING id, status, tipo, agendamento_id
-            `,
-            [
-              chamadoId,
-              CHAMADO_STATUS.CONCLUIDO,
-              checklistJson,
-              causaFinal,
-              solucaoFinal,
-              paramsBase.concluidorId,
-              paramsBase.concluidorEmail,
-              paramsBase.concluidorNome,
-            ]
-          );
-        }
+        const qEnd = await client.query(
+          `
+          UPDATE public.chamados
+             SET status               = $2,
+                 concluido_em         = NOW(),
+                 checklist            = COALESCE($3::jsonb, checklist),
+                 causa                = COALESCE($4::text, causa),
+                 solucao              = COALESCE($5::text, solucao),
+                 servico_realizado    = COALESCE($5::text, servico_realizado),
+                 concluido_por_id     = $6,
+                 concluido_por_email  = $7,
+                 concluido_por_nome   = $8,
+                 atualizado_em        = NOW()
+           WHERE id = $1
+           RETURNING id, status, tipo, agendamento_id
+          `,
+          [
+            chamadoId,
+            CHAMADO_STATUS.CONCLUIDO,
+            checklistJson,
+            causaFinal,
+            solucaoFinal,
+            paramsBase.concluidorId,
+            paramsBase.concluidorEmail,
+            paramsBase.concluidorNome,
+          ]
+        );
 
         if (!qEnd.rowCount) return null;
 
         const row = qEnd.rows[0];
 
-        // Se houver vínculo de agendamento, marque concluído
         if (row.agendamento_id) {
           await client.query(
             `UPDATE public.agendamentos_preventivos
@@ -569,10 +552,12 @@ chamadosRouter.post(
       });
 
       if (!chamadoAtualizado) {
-        return res.status(500).json({ error: 'FALHA_ATUALIZAR_CHAMADO' });
+        return res.status(500).json({ error: "FALHA_ATUALIZAR_CHAMADO" });
       }
 
-      try { sseBroadcast?.({ topic: 'chamados', action: 'updated', id: chamadoId }); } catch {}
+      try {
+        sseBroadcast?.({ topic: "chamados", action: "updated", id: chamadoId });
+      } catch {}
 
       return res.json({ ok: true, chamado: chamadoAtualizado });
     } catch (error) {
@@ -582,103 +567,70 @@ chamadosRouter.post(
   }
 );
 
-chamadosRouter.patch("/chamados/:id/checklist", async (req, res) => {
-  try {
-    const id = String(req.params.id);
-    const body = req.body || {};
-    const userEmail = String(body.userEmail || (req as any)?.user?.email || '').trim().toLowerCase();
-
-    if (!Array.isArray(body.checklist)) {
-      return res.status(400).json({ error: "checklist (array) é obrigatório." });
-    }
-    const newChecklist = body.checklist.map((x: any) => ({
-      item: String(x?.item || '').trim(),
-      resposta: (String(x?.resposta || 'sim').toLowerCase() === 'nao') ? 'nao' : 'sim',
-    }));
-
-    // 1) Busca chamado + checklist atual + máquina
-    const { rows } = await pool.query(
-      `SELECT c.id, c.maquina_id, c.tipo, c.checklist
-         FROM public.chamados c
-        WHERE c.id = $1
-        LIMIT 1`,
-      [id]
-    );
-    if (!rows.length) return res.status(404).json({ error: "Chamado não encontrado." });
-
-    const chamado = rows[0];
-    if (chamado.tipo !== 'preventiva') {
-      return res.status(400).json({ error: "Checklist só é editável em chamados 'preventiva'." });
-    }
-
-    const oldChecklist: Array<{item: string, resposta: string}> = Array.isArray(chamado.checklist)
-      ? chamado.checklist
-      : [];
-
-    // Mapa do estado anterior para detectar transição sim->nao
-    const oldMap = new Map<string, string>();
-    for (const it of oldChecklist) {
-      const key = slugifyItem(it?.item || '');
-      oldMap.set(key, String(it?.resposta || 'sim').toLowerCase());
-    }
-
-    // 2) Atualiza o checklist no chamado
-    await pool.query(
-      `UPDATE public.chamados
-          SET checklist = $2::jsonb
-        WHERE id = $1`,
-      [id, JSON.stringify(newChecklist)]
-    );
-
-    // 3) Para cada item que virou "nao", cria corretiva (evitando duplicatas)
-    //    quem cria? o userEmail (se existir em usuarios)
-    let criadoPorId: string | null = null;
-    if (userEmail) {
-      const u = await pool.query(`SELECT id FROM public.usuarios WHERE LOWER(email)=LOWER($1) LIMIT 1`, [userEmail]);
-      criadoPorId = u.rows?.[0]?.id ?? null;
-    }
-
-    const maquinaId = chamado.maquina_id;
-    let corretivasGeradas = 0;
-
-    for (const it of newChecklist) {
-      const key = slugifyItem(it.item);
-      const was = oldMap.get(key) || 'sim';
-      const now = it.resposta;
-
-      // só abre corretiva na transição sim -> nao
-      if (was !== 'nao' && now === 'nao' && it.item) {
-        // já existe corretiva aberta/andamento para este item desta máquina?
-        const dup = await pool.query(
-          `SELECT 1 FROM public.chamados
-            WHERE maquina_id = $1
-              AND tipo = 'corretiva'
-              AND status IN ('Aberto','Em Andamento')
-              AND item = $2
-            LIMIT 1`,
-          [maquinaId, it.item]
-        );
-        if (dup.rowCount) continue;
-
-        const descricao = `Preventiva: item "${it.item}" marcado como NÃO.`;
-        await pool.query(
-          `INSERT INTO public.chamados
-             (maquina_id, tipo, status, descricao, item, criado_por_id, responsavel_atual_id)
-           VALUES ($1, 'corretiva', 'Aberto', $2, $3, $4, $4)`,
-          [maquinaId, descricao, it.item, criadoPorId]
-        );
-        corretivasGeradas++;
+chamadosRouter.patch(
+  "/chamados/:id/checklist",
+  requireRole(["manutentor", "gestor"]),
+  async (req, res) => {
+    try {
+      const user = req.user;
+      if (!user?.id) {
+        return res.status(401).json({ error: "USUARIO_NAO_CADASTRADO" });
       }
+
+      const parsed = PatchChecklistSchema.safeParse(req.body ?? {});
+      if (!parsed.success) {
+        return res.status(400).json({
+          error: "VALIDATION_ERROR",
+          issues: parsed.error.issues.map(i => ({ path: i.path.join("."), message: i.message })),
+        });
+      }
+      const { checklist } = parsed.data;
+      const chamadoId = String(req.params.id);
+
+      // Carrega chamado para validar estado/permissão
+      const { rows } = await pool.query(
+        `SELECT status, manutentor_id, responsavel_atual_id, atendido_por_id
+           FROM public.chamados
+          WHERE id = $1
+          LIMIT 1`,
+        [chamadoId]
+      );
+      if (!rows.length) {
+        return res.status(404).json({ error: "CHAMADO_NAO_ENCONTRADO" });
+      }
+
+      const atual = rows[0];
+      const statusNorm = normalizeChamadoStatus(atual.status);
+      if (statusNorm === CHAMADO_STATUS.CONCLUIDO || statusNorm === CHAMADO_STATUS.CANCELADO) {
+        return res.status(409).json({ error: "INVALID_STATE", status: atual.status });
+      }
+
+
+      // manutentor/gestor: se não for gestor, precisa estar associado
+      const associados = [atual.manutentor_id, atual.responsavel_atual_id, atual.atendido_por_id]
+        .filter(Boolean)
+        .map((v: any) => String(v));
+      if (user.role !== "gestor" && !associados.includes(String(user.id))) {
+        return res.status(403).json({ error: "PERMISSAO_NEGADA" });
+      }
+
+      await pool.query(
+        `UPDATE public.chamados
+            SET checklist = $2::jsonb,
+                atualizado_em = NOW()
+          WHERE id = $1`,
+        [chamadoId, JSON.stringify(checklist)]
+      );
+
+      try { sseBroadcast?.({ topic: "chamados", action: "updated", id: chamadoId }); } catch {}
+
+      return res.json({ ok: true });
+    } catch (e: any) {
+      console.error(e);
+      return res.status(500).json({ error: String(e) });
     }
-
-    try { sseBroadcast?.({ topic: 'chamados', action: 'updated', id }); } catch {}
-
-    res.json({ ok: true, corretivasGeradas });
-  } catch (e:any) {
-    console.error(e);
-    res.status(500).json({ error: String(e) });
   }
-});
+);
 
 // ---------- Chamados: criar ----------
 /**
@@ -700,46 +652,42 @@ chamadosRouter.post("/chamados", async (req, res) => {
   try {
     const user = (req as any).user as { role?: string; email?: string } | undefined;
 
+    // ✅ validação de entrada (Zod)
+    const parsed = CreateChamadoSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      return res.status(400).json({
+        error: "VALIDATION_ERROR",
+        issues: parsed.error.issues.map(i => ({ path: i.path.join("."), message: i.message })),
+      });
+    }
+
+    const criadorEmail = user?.email;
+    if (!criadorEmail) {
+      return res.status(401).json({ error: "USUARIO_NAO_CADASTRADO" });
+    }
+
     const {
-      // identificação da máquina (opcional se vier de agendamento)
       maquinaTag,
       maquinaNome,
-
-      // descrição do problema
       descricao,
-
-      // status inicial
       status = "Aberto",
-
-      // quem cria / quem assume
-      criadoPorEmail,
       manutentorEmail,
-
-      // NOVO: abertura a partir de agendamento preventivo
       agendamentoId,
-
-      // NOVO: fallback ?? "" se quiser passar diretamente um array de strings
       checklistItems,
-    } = req.body ?? {};
+    } = parsed.data;
 
+    // mantém sua normalização de status e regra de "ativo"
     const statusNorm = normalizeChamadoStatus(status) ?? CHAMADO_STATUS.ABERTO;
     if (!isStatusAtivo(statusNorm)) {
       return res.status(400).json({ error: "Status invalido para criacao." });
     }
 
-    // tipo: padrão 'corretiva', mas aceita 'preventiva'
+    // tipo: igual ao seu (padrão corretiva; aceita preventiva)
     const tipo = String(req.body?.tipo || "corretiva").toLowerCase() === "preventiva"
       ? "preventiva"
       : "corretiva";
 
-    // validações básicas
-    if (!descricao || String(descricao).trim().length < 5) {
-      return res.status(400).json({ error: "Descrição é obrigatória (>= 5 caracteres)." });
-    }
-    if (!criadoPorEmail) {
-      return res.status(400).json({ error: "criadoPorEmail é obrigatório." });
-    }
-    // RBAC simples: operador só cria 'Aberto' e não pode atribuir
+    // RBAC igual ao seu
     const role = user?.role ?? "gestor";
     if (role === "operador") {
       if (statusNorm !== CHAMADO_STATUS.ABERTO) {
@@ -751,7 +699,7 @@ chamadosRouter.post("/chamados", async (req, res) => {
     }
 
     // ------------------------------------------------------------------------------------------
-    // 1) Se for abertura por agendamento, buscamos os dados do agendamento e preparamos checklist
+    // 1) se vier de agendamento, carrega dados e checklist base
     // ------------------------------------------------------------------------------------------
     let maquinaIdFromAg: string | null = null;
     let checklistFromAg: any[] = [];
@@ -770,7 +718,6 @@ chamadosRouter.post("/chamados", async (req, res) => {
       }
       maquinaIdFromAg = ags[0].maquina_id;
 
-      // monta [{item, resposta:'sim'}] a partir do array de strings
       if (Array.isArray(ags[0].itens_checklist)) {
         checklistFromAg = ags[0].itens_checklist.map((t: any) => ({
           item: String(t),
@@ -780,7 +727,7 @@ chamadosRouter.post("/chamados", async (req, res) => {
     }
 
     // ------------------------------------------------------------------------------------------
-    // 2) Se vier checklistItems direto no body, também aceitamos
+    // 2) checklist direto do body (strings) tem prioridade; senão, usa o do agendamento
     // ------------------------------------------------------------------------------------------
     let checklistFinal: any[] = [];
     if (Array.isArray(checklistItems) && checklistItems.length) {
@@ -790,25 +737,22 @@ chamadosRouter.post("/chamados", async (req, res) => {
       }));
     } else if (checklistFromAg.length) {
       checklistFinal = checklistFromAg;
-    } else {
-      checklistFinal = []; // sem checklist
     }
 
     // ------------------------------------------------------------------------------------------
-    // 3) Resolve máquina: por agendamento OU por tag/nome
+    // 3) resolve máquina: por agendamento OU por tag/nome
     // ------------------------------------------------------------------------------------------
-    // Se não veio por agendamento, precisa de maquinaTag/maquinaNome
     if (!maquinaIdFromAg && !maquinaTag && !maquinaNome) {
       return res.status(400).json({ error: "Informe maquinaTag ou maquinaNome (ou agendamentoId)." });
     }
 
-    // Busca ids de Usuários e máquina
+    // ids de usuários (criador e, se necessário, manutentor)
     const { rows: uCriador } = await pool.query(
       `SELECT id FROM public.usuarios WHERE LOWER(email) = LOWER($1) LIMIT 1`,
-      [criadoPorEmail]
+      [criadorEmail]
     );
     if (!uCriador.length) {
-      return res.status(400).json({ error: "criadoPorEmail inválido." });
+      return res.status(400).json({ error: "criadoPorEmail inválido (header)" });
     }
 
     let manutentorId: string | null = null;
@@ -823,7 +767,7 @@ chamadosRouter.post("/chamados", async (req, res) => {
       manutentorId = uMant[0].id;
     }
 
-    // Máquina via (tag|nome) quando não veio de agendamento
+    // máquina via agendamento OU (tag|nome)
     let maquinaId: string | null = maquinaIdFromAg;
     if (!maquinaId) {
       const { rows: maq } = await pool.query(
@@ -840,7 +784,7 @@ chamadosRouter.post("/chamados", async (req, res) => {
     }
 
     // ------------------------------------------------------------------------------------------
-    // 4) INSERT do chamado (inclui checklist jsonb). responsável inicial = manutentor (se Em Andamento)
+    // 4) INSERT do chamado (com checklist jsonb). responsável = manutentor se "Em Andamento"
     // ------------------------------------------------------------------------------------------
     const { rows: created } = await pool.query(
       `INSERT INTO public.chamados
@@ -853,19 +797,18 @@ chamadosRouter.post("/chamados", async (req, res) => {
        RETURNING id`,
       [
         maquinaId,
-        tipo,                 // 'corretiva' | 'preventiva'
-        statusNorm,           // 'Aberto' | 'Em Andamento' (canônico)
+        tipo,
+        statusNorm,
         String(descricao).trim(),
         uCriador[0].id,
         manutentorId,
-        manutentorId,         // se Em Andamento, fica como responsável
+        manutentorId,
         JSON.stringify(checklistFinal),
       ]
     );
 
     const chamadoId = created[0].id;
 
-    // (opcional) se veio de agendamento, marque como iniciado
     if (agendamentoId) {
       await pool.query(
         `UPDATE public.agendamentos_preventivos
@@ -875,7 +818,7 @@ chamadosRouter.post("/chamados", async (req, res) => {
       );
     }
 
-    // retorna o formato que sua lista já espera
+    // retorna no mesmo formato que sua lista já usa
     const { rows } = await pool.query(
       `SELECT
          c.id,
@@ -903,10 +846,10 @@ chamadosRouter.post("/chamados", async (req, res) => {
 
     try { sseBroadcast?.({ topic: "chamados", action: "created", id: chamadoId }); } catch {}
 
-    res.status(201).json(rows[0]);
+    return res.status(201).json(rows[0]);
   } catch (e:any) {
     console.error(e);
-    res.status(500).json({ error: String(e) });
+    return res.status(500).json({ error: String(e) });
   }
 });
 

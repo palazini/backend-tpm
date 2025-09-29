@@ -1,4 +1,4 @@
-﻿export type SlugOptions = {
+export type SlugOptions = {
   trimWhitespace?: boolean;
   edgePattern?: RegExp;
 };

@@ -1,5 +1,6 @@
 {
-    "name": "manutencao-api",
+    "name": "@manutencao/api",
+    "private": true,
     "version": "1.0.0",
     "description": "",
     "main": "index.js",
@@ -7,6 +8,7 @@
     "license": "ISC",
     "dependencies": {
         "@google-cloud/firestore": "^7.11.3",
+        "@manutencao/shared": "workspace:^",
         "@types/morgan": "^1.9.10",
         "bcryptjs": "^3.0.2",
         "cors": "^2.8.5",
@@ -16,7 +18,8 @@
         "firebase-admin": "^13.5.0",
         "helmet": "^8.1.0",
         "morgan": "^1.10.1",
-        "pg": "^8.16.3"
+        "pg": "^8.16.3",
+        "zod": "^3.23.8"
     },
     "devDependencies": {
         "@types/cors": "^2.8.19",

@@ -1,4 +1,4 @@
-﻿import { Router } from 'express';
+import { Router } from 'express';
 import { setupSSEClient } from '../utils/sse';
 
 export const eventsRouter = Router();

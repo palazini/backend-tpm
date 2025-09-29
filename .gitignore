@@ -16,6 +16,7 @@ yarn-error.log*
 # env/segredos
 .env
 .env.*
+.envrun.txt
 !.env.example
 *.local.env
 *.secrets.json

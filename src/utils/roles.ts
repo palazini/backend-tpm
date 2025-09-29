@@ -1,4 +1,4 @@
-﻿export function roleToFuncao(role?: string | null): string {
+export function roleToFuncao(role?: string | null): string {
   const normalized = (role ?? '').toLowerCase();
 
   switch (normalized) {
